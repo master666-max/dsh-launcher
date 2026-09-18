@@ -1,0 +1,21 @@
+# ---- 运行时缓存：包含本机真实路径与目录结构，绝不入库 ----
+dsh-env.cache.json
+dsh-dump.cache.txt
+dsh-dump.cache.txt.meta.json
+
+# ---- 运行时产物 ----
+__pycache__/
+*.pyc
+*.pyo
+
+# ---- 补丁/锁的备份 ----
+*.bak-*
+*.bak-stale-*
+*.tmp-plugins
+
+# ---- 个人覆盖配置（若将来创建）----
+dsh-config.json
+
+# ---- 临时脚本与日志 ----
+_*.py
+*.log
