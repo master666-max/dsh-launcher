@@ -11,7 +11,7 @@ __pycache__/
 # ---- 补丁/锁的备份 ----
 *.bak-*
 *.bak-stale-*
-*.tmp-plugins
+*.tmp-plugins*
 
 # ---- 个人覆盖配置（若将来创建）----
 dsh-config.json

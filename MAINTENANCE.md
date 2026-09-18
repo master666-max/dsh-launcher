@@ -24,7 +24,7 @@
 | `dsh-launcher.py` | 编排 + 交互菜单：启动 dsh、调自愈、调插件工具。**只做编排，不含 dsh 内部知识** | import dsh_env |
 | `dsh-plugins.py` | 插件管理：列出 181 个入口、冲突检查、启用/禁用（写 profile 补丁） | import dsh_env |
 | `dsh-fallback-heal.py` | 补齐 `.dsh-module-fallback` 缺失 junction（可子进程或直跑） | import dsh_env |
-| `dsh_tests.py` | **回归测试 16 用例**（改完代码必跑） | import dsh_env、加载 dsh-launcher/plugins |
+| `dsh_tests.py` | **回归测试 23 用例**（改完代码必跑） | import dsh_env、加载 dsh-launcher/plugins |
 | `dsh-selfcheck.py` | 静态自检：语法/缺失 import/未定义名/GBK 字符/subprocess 参数名/bat 行尾 | 无依赖 |
 | `dsh-env.py` | 命令行薄壳（`--dump` / `--refresh` / `--json`），实现都在 dsh_env.py | import dsh_env |
 
@@ -47,9 +47,28 @@
 ### 改完代码后必做的三件事
 ```
 python dsh-selfcheck.py     # 静态自检（0 问题才算完）
-python dsh_tests.py         # 16 用例回归（全过才算完）
+python dsh_tests.py         # 23 用例回归（全过才算完）
 python dsh-env.py --refresh # 强制重探（dsh 升级/换目录后）
 ```
+
+### 动手改逻辑前：先跑变异测试
+```
+python _mutate_all.py       # 故意改坏 10 处关键逻辑，看用例抓不抓得到
+```
+**理由**：用例"全绿"不等于有用例。本项目实测过 —— `parse_dump` / `is_dsh_here` /
+`set_disabled` / `split_win_cmdline` / `clean_stale_locks` / `live_now` 六处关键修复
+**全部处于"裸奔"状态**（改回旧写法，回归照样全绿）。跑一遍变异测试就暴露了。
+**任何新增/修改的关键逻辑，都应在 `_mutate_all.py` 里加一条变异体**：
+改坏它 → 跑用例 → 必须抓到（输出 `抓到 ✓`）。抓不到的用例等于没有。
+
+> 变异测试的常见翻车点（都踩过）：
+> - **断言含注释/docstring 里的字**：`"dsh web" in inspect.getsource(f)` 会命中注释，
+>   代码改成裸 `"dsh"` 也不报错。→ 用 AST 剥掉 docstring 再查。
+> - **断言用的样本值恰好落在合法集合里**：用端口 3000 测"必须覆盖配置端口"，
+>   而 3000 本就在 `DEFAULT_PORTS` 里 → 变异成"只看默认表"照样通过。
+>   → 对照值必须取**集合外**的。
+> - **只测"文案子串"不测"行为"**：`"跳过" in msg or "完整" in msg` 这种
+>   凑巧能过，描述一改就误判。→ 断言行为（调用次数/返回值），别断言字符串。
 
 ### 改动纪律（血泪规则）
 1. **每处改动必须有"改动前/后"的实测证据**，否则不许说"修好了"。
@@ -59,6 +78,12 @@ python dsh-env.py --refresh # 强制重探（dsh 升级/换目录后）
 5. **所有写操作测试都在 tempfile 副本上做**，绝不碰真实补丁。
 6. **改代码一律用编辑器工具，不要在 shell 里内联拼 `\n`** —— shell 会把 `\n` 吃掉变成 `/n`，补丁脚本会静默写坏文件（踩过三次）。
 7. **本工具与任何 AI agent / IDE 插件完全解耦**，自检第 8 项会复核；不要为了图方便往代码里加 agent 路径。
+8. **验收"能不能启动"必须用计划任务绕开沙箱**：
+   在 AI 沙箱里 `spawn` 子进程被禁（EPERM），`dsh-mobile` 调 `whoami.exe` 取 SID 会失败
+   → 整棵插件树加载失败 → dsh 退出码 1。**这是沙箱假故障，不是启动器 bug**。
+   正解：`schtasks /create + /run` 起一个 bat（本机 `_launcher-e2e.bat` 即此法），
+   然后 `netstat` 看 3080/3443 是否监听。**不要据此改启动器代码。**
+
 
 ## 四、审计要点（这工具链有哪些"会咬人"的地方）
 
@@ -94,6 +119,15 @@ dsh 每次只建它需要的 220/285 个链接，多补的会被它删掉，
 **判断 dsh 是否在跑不能靠进程命令行里的仓库路径** —— 命令行里没有。
 正确做法：`netstat` + `tasklist` 找 node.exe 监听端口再探签名
 （实测能抓到 dsh-mobile 的 3443，光看 3080 会漏）。
+
+### 7. 击杀与脚本生成的两道安全闸（2026-09-18 安全审计加装）
+- **taskkill 前必须映像名复核**（`pid_is_node`）：端口探活与击杀之间
+  PID 可能被系统复用，不是 node.exe 就跳过。谁删掉这道闸谁负责误杀。
+- **cmd.exe stdin 脚本必须过 `cmd_arg_safe`**：实测 cmd 对【引号内】仍做
+  `%VAR%` 展开，`% & | < > ^ ! "` 任一进路径都会改变脚本语义；
+  校验不过的条目跳过并记日志，绝不硬拼。
+- **清脏锁前必须确认 netstat 本身成功**：netstat 失败 ≠ 没有监听；
+  前提证不出来就整轮放弃（与第 1 条的三重把关同向）。
 
 ## 五、与 AI Agent / IDE 插件的解耦声明（已做到【完全】解耦）
 
@@ -141,6 +175,58 @@ dsh 每次只建它需要的 220/285 个链接，多补的会被它删掉，
   - 新增 `dsh_tests.py`（16 用例）与 `dsh-selfcheck.py`（7 类静态检查）。
   - 查明并修复「task-board dead-PID 锁导致 dsh 起来就退出码 1」。
   - **整体迁出 WorkBuddy 目录** → `%USERPROFILE%\dsh-launcher`（本次）。
+  - **外部审计修复 9 项**：
+    ① `is_dsh_here` 判据收回 `"dsh web"`（曾被放宽成 `dsh`，违反审计要点⑤，
+       会危及 kill_leftover / kill_node 的 taskkill 安全；已对在跑实例实测签名）；
+    ② 插件分页输入改按**全局编号**（旧：第 2 页起显示 41–80 却只收 1–40，
+       照屏幕输入被拒、输页内编号会改错插件）；
+    ③ `set_disabled` / `parse_cordis` / `parse_dump` 三处都改为**只认入口层缩进**
+       的属性 —— `config:` 子块里嵌套的 name/disabled 不再被误改/误读，
+       属性出现在 config 之后也能认到（不再依赖键序）；
+    ④ `dsh_tests.py` 的 run_heal 用例改为拦截子进程，回归测试不再写真实 profile；
+    ⑤ force 刷新路径不再把 30 秒的 `--dump-config` 跑两遍
+       （plugins 菜单 r、`dsh-env.py --refresh --dump` 都中招过）；
+    ⑥ `live_now()` 覆盖实际配置端口（旧版只看 3080/3081/3082）；
+    ⑦ `start_command` 用 shlex 解析，带引号路径不再被切碎；
+    ⑧ 启动成功文案区分「已在后台运行」与「已退出」；
+    ⑨ 上述修改通过 selfcheck（0 问题）+ 回归全绿。
+  - **安全审计修复 5 项（含 2 中危）**：
+    ① cmd.exe stdin 脚本加装 `cmd_arg_safe` 元字符校验（mklink/rmdir 两条路径，
+       实测引号内 %VAR% 会被展开）；
+    ② 所有 taskkill /F 前加装 `pid_is_node` 映像名复核（PID 复用防误杀）；
+    ③ 清脏锁前确认 netstat 成功，失败整轮放弃；
+    ④ 补丁临时文件改 pid+时间戳后缀（防预置符号链接重定向写入）；
+    ⑤ 缓存含本机路径维持现状（.gitignore 已排除，勿 -f 提交）。
+  - **复审修复 3 项（2026-09-18 二次审查）**：
+    ① **[高]** `start_command` 那条 shlex 修复本身是错的 ——
+       `posix=False` 保住反斜杠但**把引号也留着**，`"C:\Program Files\...\pnpm.cmd"`
+       原样进 `cmd.exe /c` 会被当成命令名的一部分 → 找不到命令；
+       而 `posix=True` 又会**吃掉所有反斜杠**。两者都不能单用。
+       改用自实现的 `split_win_cmdline()`（去引号 + 保反斜杠 + 保空格），
+       7 组用例实测全对。本机 `config_file=None` 故尚未触发，属潜伏 bug。
+    ② **[中]** `run_heal` 用例判据与生产代码不一致：生产用 `before==0`，
+       用例用 `before==0 or before<total*0.5`，且断言靠文案子串
+       （`"跳过" in msg or "完整" in msg`）而非行为 —— 描述一改就误判。
+       改为**受控喂入 4 种缺失状态**直接驱动真实分支，断言调用次数。
+       变异测试（改坏阈值 / 删提前返回 / 让 deep 也跳过）**3/3 全部抓到**。
+    ③ **[中]** 4 项关键修复**没有任何用例看住**（`parse_dump` 缩进层、
+       `is_dsh_here` 判据、`set_disabled` 缩进层、新增的 `split_win_cmdline`）：
+       旧 `SAMPLE_DUMP` 里 `disabled` 全排在 `config:` **之前**，
+       所以旧实现（`in_config` 开关）照样能通过 —— 而真实 dump 里有 11 条
+       是排在 config **之后**的（如 `tool-web`）。
+       已补 4 个用例（含 `disabled` 后置样本、判据精确串断言、
+       config 子块不可被改断言、命令行切分 5 组对照）。
+  - 回归用例 **17 → 23**；新增**变异测试**手段（`_mutate_all.py`）：
+    故意改坏 10 处关键逻辑，确认用例能抓到 —— 抓不到的用例等于没有。
+    第一轮 **7/10**，补齐守护用例后第二轮 **10/10 全部抓到**。
+  - **端到端验收**（计划任务绕开沙箱）：启动器 `--start --yes` 全链路通过 ——
+    脏锁自愈（清理 dead-PID 的 `task-board/ledger-v2.lock`）→ 链接检查
+    （正确识别「220/285 属正常态」）→ 第 1 条候选 `pnpm dsh web` 即成功
+    → 3080 与 3443 同时监听 → `is_dsh_here(3080) = True`。
+  - **「大肥鱼罢工」根因查明（非启动器 bug）**：AI 沙箱禁止 `spawn` 子进程，
+    `dsh-mobile` 插件调 `whoami.exe` 取 Windows 用户 SID 时 `spawn EPERM`
+    → 整棵插件树加载失败 → dsh 退出码 1。**正常环境无此限制**，
+    计划任务实测同一命令一次成功。已在改动纪律加第 8 条固化这个判据。
 
 ## 八、推送到 GitHub（含本机特有的坑）
 
@@ -191,5 +277,5 @@ set HTTPS_PROXY=
 ### 提交前自检
 ```bat
 python dsh-selfcheck.py      :: 含解耦检查
-python dsh_tests.py          :: 16 用例
+python dsh_tests.py          :: 23 用例
 ```

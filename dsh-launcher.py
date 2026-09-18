@@ -99,8 +99,14 @@ def find_live_ports(env):
 def kill_leftover(env):
     """结束残留的 dsh 实例（只对确认是 dsh 的端口动手）。"""
     killed = []
+    names = dsh_env.image_names()
     for p in find_live_ports(env):
         for pid in sorted(dsh_env.listening_pids(p)):
+            # [!] 探活与击杀之间 PID 可能被系统复用 —— 映像名必须是 node.exe
+            #     才动手，否则跳过（防误杀无辜进程）
+            if not dsh_env.pid_is_node(pid, names):
+                log("  [跳过] PID %s 已不是 node.exe（疑似 PID 复用），不动" % pid)
+                continue
             log("  [清理] 结束残留 dsh 实例（端口 %d，PID=%s）" % (p, pid))
             subprocess.run(["taskkill", "/F", "/PID", str(pid)],
                            capture_output=True, creationflags=FLAGS, timeout=30)
@@ -238,6 +244,7 @@ def action_start(assume_yes=False):
     chosen = None
     rc = None
     interrupted = False
+    was_live = False
     for i, c in enumerate(cmds, 1):
         log("  尝试 %d/%d：%s" % (i, len(cmds), c["label"]))
         t0 = time.time()
@@ -255,8 +262,9 @@ def action_start(assume_yes=False):
         dt = time.time() - t0
         # 判据：【端口探活】而不是运行时长 ——
         #   起来了才算成功；崩得再晚也要换下一个候选
-        if live_now():
+        if live_now(env):
             chosen = c["label"]
+            was_live = True
             break
         if rc == 0:
             chosen = c["label"]
@@ -269,7 +277,11 @@ def action_start(assume_yes=False):
     if interrupted:
         log("  已中断（dsh 未启动或已停止）")
     elif chosen:
-        log("  dsh 已退出    使用的命令：%s    退出码 = %s" % (chosen, rc))
+        if was_live:
+            log("  dsh 已在后台运行    使用的命令：%s（启动器退出码 %s）"
+                % (chosen, rc))
+        else:
+            log("  dsh 已退出    使用的命令：%s    退出码 = %s" % (chosen, rc))
     else:
         log("  所有候选命令都失败了，退出码 = %s" % rc)
         log("  建议：菜单 [5] 看环境探测报告；或检查 dsh 是否已安装依赖。")
@@ -278,9 +290,17 @@ def action_start(assume_yes=False):
     pause("  回车关闭窗口...")
 
 
-def live_now():
-    """dsh 是否真的起来了（任意候选端口探活）。"""
-    for p in dsh_env.DEFAULT_PORTS[:3]:
+def live_now(env=None):
+    """dsh 是否真的起来了（实际配置端口 + 全部候选端口探活）。
+
+    [!] 不能只看 DEFAULT_PORTS 前几个 —— 用户把端口配成 3000/8080 时
+        会误判「没起来」而接着拉起第二个实例。
+    """
+    ports = []
+    if env and env.get("port"):
+        ports.append(env["port"]["value"])
+    ports += dsh_env.DEFAULT_PORTS
+    for p in dict.fromkeys(ports):
         if dsh_env.is_dsh_here(p):
             return True
     return False

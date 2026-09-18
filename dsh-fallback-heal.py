@@ -26,6 +26,16 @@ import dsh_env as _env_mod          # 探测层单例（与 launcher/plugins 共
 
 FLAGS = getattr(subprocess, "CREATE_NO_WINDOW", 0)
 
+# cmd.exe 对 stdin 脚本【引号内】仍做 %VAR% 展开（本机实测），且 & | < > ^ ! "
+# 与控制符任何一个都会改变脚本语义。路径里含这些字符的条目一律跳过，
+# 宁可少补一个链接，也不把拼出来的额外命令喂给 cmd。
+_CMD_UNSAFE = re.compile(r"[%&|<>^!\"\r\n\t]")
+
+
+def cmd_arg_safe(p):
+    """路径能否安全拼进 cmd.exe 脚本行（mklink / rmdir 的 stdin 脚本）。"""
+    return _CMD_UNSAFE.search(p) is None
+
 # 终端是 chcp 936（GBK）时，打印非 GBK 字符会抛 UnicodeEncodeError。
 # 这里统一降级为 replace，保证任何情况下都不会因此崩溃。
 try:
@@ -92,6 +102,10 @@ def kill_node():
     try:
         for port in ports:
             for pid in sorted(_env_mod.listening_pids(port)):
+                # [!] 探活与击杀之间 PID 可能被系统复用 —— 不是 node.exe 绝不 taskkill
+                if not _env_mod.pid_is_node(pid):
+                    log("    [跳过] PID %s 已不是 node.exe（疑似 PID 复用），不动" % pid)
+                    continue
                 subprocess.run(["taskkill", "/F", "/PID", str(pid)],
                                capture_output=True, creationflags=FLAGS,
                                timeout=30)
@@ -124,6 +138,9 @@ def heal_profile(profile_dir):
         target = os.path.join(src, *name.split("/"))
         link = os.path.join(fb, *name.split("/"))
         if not os.path.isdir(target):
+            continue
+        if not (cmd_arg_safe(link) and cmd_arg_safe(target)):
+            log("    [跳过] 路径含 cmd 元字符，拒绝进 mklink 脚本：%s" % name)
             continue
         os.makedirs(os.path.dirname(link), exist_ok=True)
         # [!] 用 lexists：断链（目标丢失的 junction）在 exists 眼里是"不存在"，
@@ -203,9 +220,13 @@ def clean_pnpm_leftovers(profile_dir, max_depth=2):
             if pat.match(e.name):
                 found.append(e.path)
                 if not DRY and CLEAN:
-                    subprocess.run(["cmd.exe", "/c", "rmdir", "/S", "/Q", e.path],
-                                   capture_output=True, creationflags=FLAGS,
-                                   timeout=120)
+                    if cmd_arg_safe(e.path):
+                        subprocess.run(["cmd.exe", "/c", "rmdir", "/S", "/Q", e.path],
+                                       capture_output=True, creationflags=FLAGS,
+                                       timeout=120)
+                    else:
+                        log("    [跳过] 残留目录路径含 cmd 元字符，拒绝删除：%s"
+                            % e.path)
                 continue          # 命中的不再下钻
             if depth < max_depth:
                 scan(e.path, depth + 1)

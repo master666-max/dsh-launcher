@@ -97,6 +97,7 @@ def parse_cordis(text):
         kind = "insert" if (insert_indent is not None and ind > insert_indent) else "override"
         e = {"id": m.group(2), "name": None, "disabled": None, "kind": kind}
         j = i + 1
+        k = None
         while j < len(lines):
             nxt = lines[j]
             if not nxt.strip() or nxt.lstrip().startswith("#"):
@@ -105,14 +106,18 @@ def parse_cordis(text):
             nind = indent_of(nxt)
             if nind < ind or (nind == ind and re.match(r"^\s*-\s", nxt)):
                 break
-            s = nxt.strip()
-            mn = re.match(r"^name:\s*(.+)$", s)
-            if mn and e["name"] is None:
-                e["name"] = mn.group(1).strip().strip("'\"")
-            md = re.match(r"^disabled:\s*(.+)$", s)
-            if md and e["disabled"] is None:
-                v = md.group(1).strip()
-                e["disabled"] = "expr" if v.startswith("!!js") else (v.lower() == "true")
+            if k is None:
+                k = nind            # 第一个属性行定义入口层缩进
+            # 只认入口层的 name/disabled，config: 子块里的同名键不算
+            if nind == k:
+                s = nxt.strip()
+                mn = re.match(r"^name:\s*(.+)$", s)
+                if mn and e["name"] is None:
+                    e["name"] = mn.group(1).strip().strip("'\"")
+                md = re.match(r"^disabled:\s*(.+)$", s)
+                if md and e["disabled"] is None:
+                    v = md.group(1).strip()
+                    e["disabled"] = "expr" if v.startswith("!!js") else (v.lower() == "true")
             j += 1
         entries.append(e)
     return entries
@@ -169,9 +174,12 @@ def collect(env=None, force=False):
     dump = None
     if env and env.get("repo") and (st["profile"] or {}).get("name"):
         try:
+            # [!] detect(force=True, want_dump=True) 刚强制跑过一遍权威 dump 并
+            # 刷新了缓存；这里必须 force=False 走指纹缓存，否则 30 秒的
+            # --dump-config 会被跑两遍（菜单 r / --check 都中招）
             dump = ENV.dump_config(env["repo"]["path"],
                                    st["profile"]["name"], st["notes"],
-                                   force=force)
+                                   force=False)
         except Exception as e:
             st["notes"].append("dump-config 异常：%s" % e)
 
@@ -394,19 +402,27 @@ def set_disabled(patch, eid, flag):
         note = "追加新块 `- id: %s` / disabled: %s" % (eid, val)
     else:
         ind = indent_of(lines[target])
-        j, replaced = target + 1, False
+        j, replaced, k = target + 1, False, None
         while j < len(lines):
             cur = lines[j]
             if cur.strip() and not cur.lstrip().startswith("#"):
-                if indent_of(cur) <= ind:
-                    break
-                if re.match(r"^\s*disabled:\s*", cur):
-                    lines[j] = " " * indent_of(cur) + "disabled: " + val
+                ci = indent_of(cur)
+                if ci <= ind:
+                    break            # 下一个入口
+                if k is None:
+                    k = ci           # 第一个属性行定义入口键的缩进层
+                # [!] 只认入口层的 disabled —— config: 子块里嵌套的同名键
+                #     是插件自己的配置，改它会静默改错地方
+                if ci == k and re.match(r"^\s*disabled:\s*", cur):
+                    lines[j] = " " * ci + "disabled: " + val
                     replaced = True
                     break
             j += 1
         if not replaced:
-            lines.insert(target + 1, "  disabled: " + val)
+            # 插在与其它入口属性相同的缩进层上（无属性时按惯例 +2）
+            lines.insert(target + 1,
+                         " " * (k if k is not None else ind + 2)
+                         + "disabled: " + val)
             note = "为 `%s` 新增 disabled: %s" % (eid, val)
         else:
             note = "把 `%s` 的 disabled 改为 %s" % (eid, val)
@@ -430,7 +446,9 @@ def set_disabled(patch, eid, flag):
 
     # [A1] 原子替换：先写同目录临时文件，再 os.replace。
     #      直接覆写时，dsh（patchReload=live）可能在写入中途读到半截 YAML。
-    tmp = patch + ".tmp-plugins"
+    #      后缀带 pid+时间戳：固定可预测的临时名会被预置的符号链接重定向写入。
+    tmp = "%s.tmp-plugins-%d-%d" % (patch, os.getpid(),
+                                    int(time.time() * 1000) % 100000)
     try:
         with open(tmp, "wb") as f:
             f.write(out_text.encode("utf-8"))
@@ -534,7 +552,7 @@ def render(st, rows, conflicts, page, per_page):
              sum(1 for r in rows if r["state"] == "禁用"),
              sum(1 for r in rows if r["state"] == "条件")),
           "",
-          "  输入编号 = 切换启用/禁用",
+          "  输入编号 = 切换启用/禁用（按屏幕上的全局编号）",
           "  n 下页  p 上页  c 冲突  f 补链接  e 环境探测  r 刷新  q 退出",
           ""]
     return "\n".join(o), page
@@ -672,11 +690,12 @@ def main():
             print("  无效输入")
             time.sleep(1)
             continue
+        # [!] 列表显示的是全局编号（第 2 页从 41 开始），输入必须按同一套编号；
+        #     旧逻辑只收页内 1-40，照屏幕输入会被拒、输页内编号又改错行
         n = int(cmd)
-        idx = page * PAGE_SIZE + (n - 1)
-        if not (1 <= n <= PAGE_SIZE) or not (0 <= idx < len(rows)):
-            print("  超出范围（本页有效编号 1 - %d）"
-                  % min(PAGE_SIZE, len(rows) - page * PAGE_SIZE))
+        idx = n - 1
+        if not (0 <= idx < len(rows)):
+            print("  超出范围（有效编号 1 - %d）" % len(rows))
             time.sleep(1.4)
             continue
 

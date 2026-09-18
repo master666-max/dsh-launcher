@@ -16,7 +16,7 @@ dsh 环境探测层（可 import 的单例模块）
     从 3-4 次 netstat 降到 1 次。
   * detect() 的缓存命中返回**深拷贝**，调用方随便改都不会污染缓存。
 """
-import os, sys, json, time, glob, copy, shutil, socket, threading, subprocess
+import os, sys, json, time, glob, copy, shutil, socket, threading, subprocess, shlex
 import http.client
 import re as _re_mod
 
@@ -160,7 +160,7 @@ def list_pkgs(root):
 
 
 # ============================ 进程 / 端口 ============================
-_netstat_cache = {"ts": 0.0, "rows": []}
+_netstat_cache = {"ts": 0.0, "rows": [], "ok": True}
 _netstat_lock = threading.Lock()
 
 
@@ -169,6 +169,8 @@ def netstat_table(refresh=False):
 
     整个工具链所有端口相关判断都吃这一份快照，
     把「一次启动预检 3-4 次 netstat」压到 1 次。
+    另记录最近一次是否成功（`ok`）——清脏锁这类「判断错就删文件」的
+    操作必须先确认探测本身没失败，否则宁可不动作。
     """
     now = time.time()
     with _netstat_lock:
@@ -190,6 +192,7 @@ def netstat_table(refresh=False):
                     rows.append({"port": port, "pid": int(pid)})
         _netstat_cache["ts"] = time.time()
         _netstat_cache["rows"] = rows
+        _netstat_cache["ok"] = (rc == 0)
         return rows
 
 
@@ -203,7 +206,7 @@ def listening_pids(port):
     return {r["pid"] for r in netstat_table() if r["port"] == port}
 
 
-def _image_names():
+def image_names():
     """一次 tasklist：PID → 进程名（小写）。"""
     names = {}
     try:
@@ -221,9 +224,21 @@ def _image_names():
     return names
 
 
+def pid_is_node(pid, names=None):
+    """PID 当前是否还是 node.exe —— 一切 taskkill /F 前的最后一道闸。
+
+    「端口签名探活 → 取 PID → 击杀」之间隔着几百毫秒，进程可能刚好退出、
+    PID 被系统复用给别的程序；不复核就会误杀无辜进程。
+    查不到映像名时一律按「不是 node」处理（宁可放过）。
+    """
+    if names is None:
+        names = image_names()
+    return names.get(str(pid)) == "node.exe"
+
+
 def node_listening_ports():
     """所有由 node.exe 监听的端口（dsh 一定是 node 进程）。"""
-    names = _image_names()
+    names = image_names()
     return sorted({r["port"] for r in netstat_table()
                    if names.get(str(r["pid"])) == "node.exe"})
 
@@ -285,7 +300,11 @@ def is_dsh_here(port):
     try:
         st, body = _probe_http(port)
         low = body.decode("utf-8", "replace").lower()
-        return (st == 401 and "authentication required" in low and "dsh" in low)
+        # [!] 第三条必须是 "dsh web"（正文原文如此，已实测）——放宽成 "dsh"
+        #     会把任何恰好 401 且正文带 dsh 字样的本地服务误判成 dsh，
+        #     kill_leftover / kill_node 就敢对它 taskkill /F 了
+        return (st == 401 and "authentication required" in low
+                and "dsh web" in low)
     except Exception:
         return False
 
@@ -376,6 +395,14 @@ def clean_stale_locks(log=None):
     """
     def _log(m):
         (log or print)(m)
+
+    # [!] 本函数的一切删除动作都以「确认没有 dsh 在跑」为前提；
+    #     而「没有在跑」只能靠 netstat 证明 —— 探测本身失败时（rc != 0，
+    #     空表≠没有监听），前提无法成立，宁可不清理也不能误删活锁。
+    netstat_table()
+    if not _netstat_cache.get("ok", True):
+        _log("  [!] netstat 探测失败 —— 无法可靠判断 dsh 是否在跑，为安全起见不清锁")
+        return []
 
     if is_dsh_here(DEFAULT_PORTS[0]) or dsh_running_any_port():
         _log("  [!] 检测到 dsh 正在运行 —— 为安全起见不清锁")
@@ -645,6 +672,39 @@ def prebuilt_entry(repo):
     return lib
 
 
+def split_win_cmdline(s):
+    """把 Windows 命令行拆成 argv —— 去引号、保反斜杠、保空格。
+
+    Windows 的规则与 POSIX 不同：
+      * `"` 只用来**分组**（让空格属于同一个参数），不是转义字符，分组后要去掉；
+      * `\\` 是普通路径分隔符，**绝不能**像 shlex(posix=True) 那样吞掉；
+      * 反斜杠只有在**紧贴引号**时才可能充当转义（`\\"` 表示字面引号），
+        本场景（路径 + 子命令）用不到，故一律当普通字符。
+
+    三个反例（本机实测）：
+        "C:\\Program Files\\nodejs\\pnpm.cmd" dsh web
+          .split()                 → ['"C:\\Program', 'Files\\nodejs\\pnpm.cmd"', ...]  切碎
+          shlex.split(posix=False) → ['"C:\\Program Files\\nodejs\\pnpm.cmd"', ...]     引号残留
+          shlex.split(posix=True)  → ['C:\\Program Files\\nodejs\\pnpm.cmd', ...]       ← 这个恰好对
+        C:\\Users\\26672\\...\\pnpm.cmd dsh web
+          shlex.split(posix=True)  → ['C:Users26672...pnpm.cmd', ...]                  反斜杠全丢
+    所以两者都不能单用，这里自己实现，两组用例都正确。
+    """
+    out, cur, in_q = [], [], False
+    for ch in s:
+        if ch == '"':
+            in_q = not in_q                 # 引号只切换分组状态，本身不保留
+        elif ch.isspace() and not in_q:
+            if cur:
+                out.append("".join(cur))
+                cur = []
+        else:
+            cur.append(ch)
+    if cur:
+        out.append("".join(cur))
+    return out or [s]
+
+
 def discover_start_cmds(repo, profile_name, cfg, notes):
     """返回 [{label, argv}]，按可靠性排序。
 
@@ -659,7 +719,14 @@ def discover_start_cmds(repo, profile_name, cfg, notes):
             out.append({"label": label, "argv": argv})
 
     if cfg.get("start_command"):
-        push(cfg["start_command"], ["cmd.exe", "/c"] + cfg["start_command"].split())
+        # [!] 三种切法都不对，必须用自带的 split_win_cmdline：
+        #       .split()                → 带空格路径被切碎
+        #       shlex.split(posix=False)→ 保住反斜杠，但**引号也留着**，
+        #                                 送进 cmd.exe 会被当成命令名的一部分 → 找不到命令
+        #       shlex.split(posix=True) → 引号去掉了，但**吃掉所有反斜杠** → 路径全毁
+        #     正解：去引号 + 保留反斜杠 + 保留空格（见该函数注释）
+        push(cfg["start_command"],
+             ["cmd.exe", "/c"] + split_win_cmdline(cfg["start_command"]))
 
     if not repo or not os.path.isdir(repo):
         return out
@@ -777,11 +844,17 @@ def dump_config(repo, profile_name, notes, force=False, timeout=240):
 
 
 def parse_dump(text):
-    """dump-config 输出 → [{id, name, disabled, section}]"""
+    """dump-config 输出 → [{id, name, disabled, section}]
+
+    [!] 入口属性（name/disabled）只认【入口层缩进】——由该入口第一个属性行
+        定义；比它深的一律是 config: 等子块，里面的同名键不是入口属性。
+        旧实现用 in_config 开关，属性出现在 config: 之后会被整段丢掉；
+        现在只看缩进层，与键序无关。
+    """
     entries = []
     section = "(unknown)"
     cur = None
-    in_config = False
+    k = None
     for raw in text.splitlines():
         if raw.startswith("# =="):
             section = raw[4:].strip()
@@ -791,16 +864,16 @@ def parse_dump(text):
             cur = {"id": m.group(1), "name": None, "disabled": None,
                    "section": section}
             entries.append(cur)
-            in_config = False
+            k = None
             continue
-        if cur is None:
+        if cur is None or not raw.strip() or raw.lstrip().startswith("#"):
             continue
+        ind = len(raw) - len(raw.lstrip(" "))
+        if k is None:
+            k = ind                  # 该入口第一个属性行定义入口层缩进
+        if ind != k:
+            continue                 # 子块内部（config: 的孩子等），一律不看
         s = raw.strip()
-        if s.startswith("config:"):
-            in_config = True        # config 块里的 name/disabled 不是入口属性
-            continue
-        if in_config:
-            continue
         m2 = _re_name.match(s)
         if m2 and cur["name"] is None:
             cur["name"] = m2.group(1).strip().strip("'\"")
@@ -809,7 +882,6 @@ def parse_dump(text):
         if m3 and cur["disabled"] is None:
             v = m3.group(1).strip()
             cur["disabled"] = "expr" if v.startswith("!!js") else (v.lower() == "true")
-            continue
     return entries
 
 

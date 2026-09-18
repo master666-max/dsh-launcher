@@ -22,7 +22,9 @@ if __name__ == "__main__":
         if not repo or not prof:
             print("（仓库或 profile 未定位到，无法生成 dump）")
         else:
-            print(dsh_env.dump_config(repo, prof, [], force=True)
+            # detect(--refresh) 已强制跑过一遍并刷新缓存；这里 force=False
+            # 让指纹缓存命中即可，避免 30 秒的 --dump-config 跑两遍
+            print(dsh_env.dump_config(repo, prof, [], force=False)
                   or "（--dump-config 不可用）")
     else:
         print(dsh_env.report(env))
