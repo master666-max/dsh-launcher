@@ -141,3 +141,55 @@ dsh 每次只建它需要的 220/285 个链接，多补的会被它删掉，
   - 新增 `dsh_tests.py`（16 用例）与 `dsh-selfcheck.py`（7 类静态检查）。
   - 查明并修复「task-board dead-PID 锁导致 dsh 起来就退出码 1」。
   - **整体迁出 WorkBuddy 目录** → `%USERPROFILE%\dsh-launcher`（本次）。
+
+## 八、推送到 GitHub（含本机特有的坑）
+
+远程私有仓库：**https://github.com/master666-max/dsh-launcher**
+
+### 常规更新流程
+```bat
+cd %USERPROFILE%\dsh-launcher
+git add -A
+git commit -m "说明"
+git push
+```
+
+### 本机两个必知前提
+
+**① push 会被全局规则改写成 SSH（22 端口被拒）**
+
+本机 git 全局配了：
+```
+url.git@github.com:.pushinsteadof = https://github.com/
+```
+于是 `git push` 会被改写成 `git@github.com:...`，而 SSH 22 端口在本机连不上。
+推之前先临时禁用这条规则、推完恢复：
+
+```bat
+git config --global --unset url.git@github.com:.pushinsteadof
+git push
+git config --global url.git@github.com:.pushinsteadof https://github.com/
+```
+
+**② 命令行里不要带沙箱代理变量**
+
+若 shell 里有 `http_proxy=http://127.0.0.1:7207`，GitHub 会报
+`CONNECT tunnel failed, response 502`。推送前清掉代理即可（加速器是 hosts 改法，
+DNS 指到 127.0.0.1，直连反而通）：
+
+```bat
+set http_proxy=
+set https_proxy=
+set HTTP_PROXY=
+set HTTPS_PROXY=
+```
+
+### 绝不入库的内容
+`.gitignore` 已排除：`dsh-env.cache.json`、`dsh-dump.cache.txt`(+meta)、
+`__pycache__`、`*.bak-*`、`_*.py`。**缓存文件含本机真实路径与个人目录结构，永远不要提交。**
+
+### 提交前自检
+```bat
+python dsh-selfcheck.py      :: 含解耦检查
+python dsh_tests.py          :: 16 用例
+```
