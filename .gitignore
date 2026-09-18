@@ -18,4 +18,5 @@ dsh-config.json
 
 # ---- 临时脚本与日志 ----
 _*.py
+_*.out
 *.log

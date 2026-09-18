@@ -220,6 +220,41 @@ for p in BAT_FILES:
         if 'dsh-launcher.py' not in txt:
             add("中", f, "未转交 dsh-launcher.py")
 
+        # ---- 块内跨行 if 检测（2026-09-18 秒退事故的常驻回归器）----
+        # 实证：cmd 在【从批处理文件调用】的场景下，只要 for/if 括号块内出现
+        #   `if <条件>` 独占一行、下一行才 `set ...`（无论加不加括号、行尾有没有空格）
+        # 就会让整个块 rc=255 或静默中止，双击 -> 窗口还没打印就消失（秒退）。
+        # 最小对照（A 原样 / B 给 if 加括号 / C 合并一行 / D 去行尾空格）：
+        #   A rc=255  B rc=255  C rc=0  D rc=255
+        # => 唯一解 = `if` 与它的命令必须写在【同一行】。
+        #
+        # 难点：`IF` 的语法不支持嵌套，`if not defined PYEXE if exist "..."` 里的
+        # 第二个 if 其实是被当作【命令】的，只是同样没带语句体。所以要
+        # 【循环剥离】链式条件，直到剥不动为止；剥完还剩东西才算「有命令」。
+        # 曾经只剥一层 -> body 剩余 `if exist "..."` -> 非空 -> 漏报（检测器形同虚设）。
+        COND_RE = re.compile(
+            r"^if\s+(not\s+)?(defined\s+\S+|exist\s+\S+"
+            r"|errorlevel\s+\d+|\S+==\S+)\s*")
+        lines_all = txt.splitlines()
+        depth = 0
+        for i, l in enumerate(lines_all, 1):
+            # 必须 strip 前导空白再用 `^if` 匹配（曾漏这步导致永不匹配）
+            s = l.strip()
+            if depth > 0 and l[:1] in (" ", "\t") and s.startswith("if "):
+                rest = s
+                while True:
+                    m = COND_RE.match(rest)
+                    if not m:
+                        break
+                    rest = rest[m.end():].strip()
+                if not rest:
+                    add("很高", f,
+                        "行%d：括号块内 if 独占一行、命令另起一行 —— "
+                        "会让整个块语法错、启动器秒退（必须 if 与命令同行）" % i)
+            depth += l.count("(") - l.count(")")
+            if depth < 0:
+                depth = 0
+
 # ---------- 7) 解耦检查：不得残留任何 agent / IDE 插件依赖 ----------
 # 本工具应完全独立：代码里不出现 agent 目录、不读 agent 环境变量。
 #
