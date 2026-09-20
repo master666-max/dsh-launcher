@@ -5,6 +5,14 @@
 """
 import os, sys, json
 
+# 与其余运行入口一致：chcp 936 终端打印非 GBK 字符（如含特殊字符的路径）
+# 会抛 UnicodeEncodeError，统一降级为 replace
+try:
+    sys.stdout.reconfigure(errors="replace")
+    sys.stderr.reconfigure(errors="replace")
+except Exception:
+    pass
+
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 import dsh_env
 

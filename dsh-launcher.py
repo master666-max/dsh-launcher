@@ -15,7 +15,7 @@ dsh 启动器（终端菜单）
 本文件**只做编排与交互**：所有 dsh 相关知识（仓库/profile/端口/命令/锁/进程）
 都在 `dsh_env.py` 探测层里。本文件不 import dsh 的任何东西。
 """
-import os, sys, time, subprocess
+import os, sys, time, subprocess, tempfile
 
 TOOLS = os.path.dirname(os.path.abspath(__file__))
 if TOOLS not in sys.path:
@@ -96,21 +96,73 @@ def find_live_ports(env):
     return [p for p in dict.fromkeys(ports) if p in live and dsh_env.is_dsh_here(p)]
 
 
+INSTANCE_LOCK = os.path.join(tempfile.gettempdir(), "dsh-launcher.instance.lock")
+
+
+def acquire_instance_lock():
+    """跨实例互斥：拿不到 = 另一个启动器正在启动 dsh。
+
+    [!] 防的是「双击两次、两个实例都过了『未运行』守卫 → 两个 dsh 抢启动
+        → junction 并发竞态（EPERM 崩溃家族）+ 清锁误删活锁」。
+        上次崩溃的残锁（记录的 pid 已死）自愈后重试一次。
+    """
+    for attempt in (1, 2):
+        try:
+            fd = os.open(INSTANCE_LOCK, os.O_CREAT | os.O_EXCL | os.O_RDWR)
+            os.write(fd, str(os.getpid()).encode())
+            os.close(fd)
+            return True
+        except FileExistsError:
+            other = ""
+            try:
+                with open(INSTANCE_LOCK) as f:
+                    other = f.read().strip()
+            except Exception:
+                pass
+            if attempt == 1 and other.isdigit() \
+                    and dsh_env.pid_alive(int(other)) is False:
+                release_instance_lock()
+                continue
+            log("  [X] 另一个启动器实例正在启动 dsh（pid %s）—— 不并发拉起。" % other)
+            return False
+        except Exception as e:
+            log("  [!] 实例锁创建失败（%s）—— 保守起见本次不启动。" % e)
+            return False
+    return False
+
+
+def release_instance_lock():
+    try:
+        os.remove(INSTANCE_LOCK)
+    except OSError:
+        pass
+
+
 def kill_leftover(env):
     """结束残留的 dsh 实例（只对确认是 dsh 的端口动手）。"""
     killed = []
     names = dsh_env.image_names()
     for p in find_live_ports(env):
-        for pid in sorted(dsh_env.listening_pids(p)):
-            # [!] 探活与击杀之间 PID 可能被系统复用 —— 映像名必须是 node.exe
-            #     才动手，否则跳过（防误杀无辜进程）
+        # [!] 击杀用【强制刷新】的端口表 —— 旧版吃 ≤3 秒陈旧快照，
+        #     PID 复用时连 pid_is_node 复核都救不回「一开始就查错了人」
+        for pid in sorted(dsh_env.verified_listening_pids(p)):
             if not dsh_env.pid_is_node(pid, names):
                 log("  [跳过] PID %s 已不是 node.exe（疑似 PID 复用），不动" % pid)
                 continue
             log("  [清理] 结束残留 dsh 实例（端口 %d，PID=%s）" % (p, pid))
-            subprocess.run(["taskkill", "/F", "/PID", str(pid)],
-                           capture_output=True, creationflags=FLAGS, timeout=30)
-            killed.append(pid)
+            try:
+                subprocess.run(["taskkill", "/F", "/PID", str(pid)],
+                               capture_output=True, creationflags=FLAGS,
+                               timeout=30)
+                killed.append(pid)
+            except Exception as e:
+                # [!] taskkill 挂起/失败绝不能炸掉整个启动流程
+                #     （旧版 TimeoutExpired 会一路抛穿只捕 KeyboardInterrupt
+                #     的顶层守卫，窗口秒退、dsh 状态不明）
+                log("  [!] taskkill 失败（PID=%s）：%s" % (pid, e))
+    if killed:
+        time.sleep(2)
+    return killed
     if killed:
         time.sleep(2)
     return killed
@@ -165,6 +217,16 @@ def run_heal(env, deep=False):
 
 # ==================== 动作 ====================
 def action_start(assume_yes=False):
+    if not acquire_instance_lock():
+        pause()
+        return
+    try:
+        _action_start_impl(assume_yes)
+    finally:
+        release_instance_lock()
+
+
+def _action_start_impl(assume_yes):
     env = probe()
     line("=")
     log("  启动 dsh")
@@ -220,6 +282,7 @@ def action_start(assume_yes=False):
                 return
 
     # ---- 前置：清掉强杀留下的脏锁（否则插件树会崩）----
+    log("  正在检查强杀残留锁（有 dsh 运行时不清理，最坏约 15 秒）...")
     dsh_env.clean_stale_locks(log=log)
 
     # ---- 第 1 步：自愈（只在机制存在时做；正常状态会跳过）----
@@ -249,7 +312,10 @@ def action_start(assume_yes=False):
         log("  尝试 %d/%d：%s" % (i, len(cmds), c["label"]))
         t0 = time.time()
         try:
-            rc = subprocess.call(c["argv"], cwd=rpath, env=penv)
+            # cmdline（字符串命令行）优先：cmd /s /c 的整体外引号只有用
+            # 字符串直传才不会被 list2cmdline 转义坏
+            rc = subprocess.call(c.get("cmdline") or c["argv"],
+                                 cwd=rpath, env=penv)
         except KeyboardInterrupt:
             log()
             log("  已中断。")
@@ -368,7 +434,15 @@ def action_env():
     log("  环境探测报告")
     line("=")
     log()
-    log(dsh_env.report(dsh_env.detect(force=True, want_dump=True)))
+    # [!] force 路径会串行跑 `pnpm dsh --help`（最坏 90s）和 --dump-config
+    #     （最坏 240s）—— 必须有护栏和预告，否则异常直接炸穿菜单、
+    #     正常时又是几分钟无输出的「死窗口」
+    log("  正在强制重探（`dsh --help` + `--dump-config`，最坏约 5 分钟）...")
+    try:
+        log(dsh_env.report(dsh_env.detect(force=True, want_dump=True)))
+    except Exception as e:
+        log("  [X] 探测失败：%s" % e)
+        log("      可尝试删除缓存后重试：%s" % dsh_env.CACHE)
     log()
     log("  配置覆盖：%s" % dsh_env.CFG)
     log("  （该文件可选；不存在时全部自动探测）")
@@ -463,6 +537,10 @@ def main():
         log("  检测到按键 —— 进入菜单。")
         time.sleep(0.4)
 
+    return _main_menu()
+
+
+def _main_menu():
     while True:
         if os.name == "nt":
             os.system("title DeepSeek Harness")
@@ -479,24 +557,27 @@ def main():
         low = cmd.lower()
         if low in ("0", "q", "quit", "exit"):
             return 0
-        if low in ("", "1"):
-            action_start()
-            return 0
-        if low == "2":
-            run_plugins()
-            continue
-        if low == "3":
-            action_check()
-            continue
-        if low == "4":
-            action_heal()
-            continue
-        if low == "5":
-            action_env()
-            continue
-
-        log("  无效输入：%s" % cmd)
-        time.sleep(1.2)
+        # [!] 各动作期间的 Ctrl+C 一律返回菜单，不再整个退出
+        #     （旧行为：检查/探测 600 秒内按 Ctrl+C 会直接关掉启动器）
+        try:
+            if low in ("", "1"):
+                action_start()
+                return 0
+            if low == "2":
+                run_plugins()
+            elif low == "3":
+                action_check()
+            elif low == "4":
+                action_heal()
+            elif low == "5":
+                action_env()
+            else:
+                log("  无效输入：%s" % cmd)
+                time.sleep(1.2)
+        except KeyboardInterrupt:
+            print()
+            log("  已中断，返回菜单。")
+            time.sleep(0.6)
 
 
 if __name__ == "__main__":

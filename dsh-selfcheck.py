@@ -13,7 +13,7 @@
 
 用法：python dsh-selfcheck.py
 """
-import os, ast, re, sys, builtins
+import os, ast, re, sys, glob, builtins
 
 # 终端是 chcp 936（GBK）时，打印非 GBK 字符会抛 UnicodeEncodeError。
 try:
@@ -27,6 +27,11 @@ DESK = os.path.join(os.path.expanduser("~"), "Desktop")
 # 注意：dsh-selfcheck.py 自己不列入（它内含解耦检测的模式串，会自报）
 PY_FILES = ["dsh_env.py", "dsh-launcher.py", "dsh-plugins.py",
             "dsh-fallback-heal.py", "dsh_tests.py", "dsh-env.py"]
+# [!] 目录里的 _*.py 临时脚本也在扫描面内 —— 它们会被真实运行，
+#     解耦红线对其同样生效（曾漏掉 _accept_all.py 里的 .workbuddy 硬编码）。
+#     语法/未定义名等 AST 检查仍只跑 PY_FILES（临时脚本随写随删，不追求全检）。
+TEMP_PY_FILES = sorted(os.path.basename(x) for x in glob.glob(
+    os.path.join(TOOLS, "_*.py")))
 # 只检查真正的用户入口（桌面 bat）。
 # dsh-run.bat 是过去的计划任务测试入口，已于 2026-09-18 删除，不再纳入检查。
 BAT_FILES = [os.path.join(DESK, "start-dsh.bat")]
@@ -232,15 +237,31 @@ for p in BAT_FILES:
         # 第二个 if 其实是被当作【命令】的，只是同样没带语句体。所以要
         # 【循环剥离】链式条件，直到剥不动为止；剥完还剩东西才算「有命令」。
         # 曾经只剥一层 -> body 剩余 `if exist "..."` -> 非空 -> 漏报（检测器形同虚设）。
+        #
+        # [!] 2026-09-19 审计补漏（旧版四种形态全部漏检）：
+        #   a. 大写 `IF`（batch 大小写不敏感）→ re.I；
+        #   b. 顶格 if（块内缩进是可选的）→ 去掉缩进门槛；
+        #   c. `if exist "C:\Program Files\x"`（带引号含空格路径）→
+        #      exist 改吃完整引号串；`if "%A%" == "x"` → == 两侧允许引号串；
+        #   d. 括号深度计数把 echo/rem 里的括号算进去（`echo :)` 全文件
+        #      破坏深度）→ 先剥 rem 注释与引号段再计数。
         COND_RE = re.compile(
-            r"^if\s+(not\s+)?(defined\s+\S+|exist\s+\S+"
-            r"|errorlevel\s+\d+|\S+==\S+)\s*")
+            r"^if\s+(not\s+)?(defined\s+\S+|exist\s+(\"[^\"]*\"|\S+)"
+            r"|errorlevel\s+\d+|(\"[^\"]*\"|\S+)\s*==\s*(\"[^\"]*\"|\S+))\s*",
+            re.I)
         lines_all = txt.splitlines()
         depth = 0
         for i, l in enumerate(lines_all, 1):
+            # 剥 rem 注释（整词，别把路径里的 rem 截出来）与引号段后计括号
+            code_l = re.split(r"(?i)(?<![^\s])rem\s", l)[0] \
+                if re.search(r"(?i)(?<![^\s])rem\s", l) else l
+            code_l = re.sub(r'"[^"]*"', '""', code_l)
+            depth += code_l.count("(") - code_l.count(")")
+            if depth < 0:
+                depth = 0
             # 必须 strip 前导空白再用 `^if` 匹配（曾漏这步导致永不匹配）
-            s = l.strip()
-            if depth > 0 and l[:1] in (" ", "\t") and s.startswith("if "):
+            s = l.strip().lstrip("@")
+            if depth > 0 and re.match(r"^if\s", s, re.I):
                 rest = s
                 while True:
                     m = COND_RE.match(rest)
@@ -251,9 +272,6 @@ for p in BAT_FILES:
                     add("很高", f,
                         "行%d：括号块内 if 独占一行、命令另起一行 —— "
                         "会让整个块语法错、启动器秒退（必须 if 与命令同行）" % i)
-            depth += l.count("(") - l.count(")")
-            if depth < 0:
-                depth = 0
 
 # ---------- 7) 解耦检查：不得残留任何 agent / IDE 插件依赖 ----------
 # 本工具应完全独立：代码里不出现 agent 目录、不读 agent 环境变量。
@@ -270,16 +288,33 @@ AGENT_PAT = re.compile(
 ENV_AGENT = re.compile(r"os\.environ\.get\(\s*['\"]"
                        r"(" + _A1.upper() + "|" + _A2.upper() + "|"
                        + _A3.upper() + ")[A-Z_]*['\"]", re.I)
-for f in PY_FILES:
+for f in PY_FILES + TEMP_PY_FILES:
     fp = os.path.join(TOOLS, f)
     if not os.path.exists(fp):
         continue
-    for i, l in enumerate(open(fp, encoding="utf-8").read().splitlines(), 1):
-        # 注释行里的举例不算耦合，跳过
-        code = l.split("#")[0]
+    src = open(fp, encoding="utf-8").read()
+    # [!] 用 tokenize 剥注释 —— 旧版 split("#")[0] 是文本级切分：
+    #     字符串里含 `#` 时（如 open("cfg#.workbuddy")）会把真耦合藏在
+    #     「注释」里漏检。tokenize 按语法区分注释与代码（字符串保留，
+    #     字符串里藏路径同样是违规）。
+    import io, tokenize
+    code_by_line = {}
+    try:
+        for tok in tokenize.generate_tokens(io.StringIO(src).readline):
+            if tok.type in (tokenize.COMMENT, tokenize.NL, tokenize.NEWLINE,
+                            tokenize.INDENT, tokenize.DEDENT,
+                            tokenize.ENDMARKER, tokenize.ENCODING):
+                continue
+            code_by_line.setdefault(tok.start[0], []).append(tok.string)
+    except Exception:
+        # tokenize 失败（残缺的临时脚本）→ 整行扫描：宁可误报不漏报
+        for i, l in enumerate(src.splitlines(), 1):
+            code_by_line[i] = [l]
+    for i, frags in sorted(code_by_line.items()):
+        code = "".join(frags)
         if AGENT_PAT.search(code):
             add("很高", f, "行%d 出现 agent 目录引用（应完全解耦）：%s"
-                % (i, l.strip()[:70]))
+                % (i, code.strip()[:70]))
         if ENV_AGENT.search(code):
             add("高", f, "行%d 读取了 agent 的环境变量" % i)
 
@@ -289,7 +324,8 @@ for bp in BAT_FILES:
         continue
     txt = open(bp, "rb").read().decode("gbk", "replace")
     for i, l in enumerate(txt.splitlines(), 1):
-        code = l.split("rem")[0]
+        # rem 是整词才算注释 —— 旧版 split("rem") 会被路径里的 rem 截断漏检
+        code = re.split(r"(?i)(?<![^\s])rem\s", l)[0]
         if AGENT_PAT.search(code):
             add("很高", os.path.basename(bp),
                 "行%d 引用 agent 目录（应完全解耦）：%s" % (i, l.strip()[:70]))

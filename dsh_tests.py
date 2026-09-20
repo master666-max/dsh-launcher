@@ -14,6 +14,13 @@ T = os.path.dirname(os.path.abspath(__file__))
 if T not in sys.path:
     sys.path.insert(0, T)
 
+# 与其余运行入口一致：chcp 936 终端打印非 GBK 字符会抛 UnicodeEncodeError
+try:
+    sys.stdout.reconfigure(errors="replace")
+    sys.stderr.reconfigure(errors="replace")
+except Exception:
+    pass
+
 import dsh_env
 
 dsh_plugins = None   # 由 __main__ 用 importlib 动态注入（文件名带连字符）
@@ -56,7 +63,7 @@ def expect(cond, msg):
 # ============================================================
 # 1. 锁判定
 # ============================================================
-@case("lock_is_stale：0 字节 / 畸形 JSON / dead-PID / 活 pid / 非 JSON 数字")
+@case("lock_is_stale：0字节 / 畸形 / dead-PID / 活node / PID复用 / 无pid / 查不到映像名")
 def t_lock():
     d = tempfile.mkdtemp(prefix="dsh_t_lock_")
     try:
@@ -75,11 +82,27 @@ def t_lock():
         stale, why = dsh_env.lock_is_stale(f2)
         expect(stale, "dead-pid 应判脏，实际 %r" % why)
 
+        # ---- 活 pid 的三种情况 ----
+        # 必须【显式传入 names】来模拟真实映像名。旧用例直接拿 os.getpid()
+        # （python.exe）当"活 dsh"，是不真实的样本 —— 真实活锁必须由 node.exe 持有。
         f3 = os.path.join(d, "d.lock")
         open(f3, "w", encoding="utf-8").write(
             json.dumps({"pid": os.getpid(), "token": "x"}))
-        stale, why = dsh_env.lock_is_stale(f3)
-        expect(not stale, "活 pid 不应判脏，实际 %r" % why)
+        me = str(os.getpid())
+
+        stale, why = dsh_env.lock_is_stale(f3, {me: "node.exe"})
+        expect(not stale, "活 pid 且确实是 node.exe（dsh 在跑）不应判脏，实际 %r" % why)
+
+        # [2026-09-20] PID 被系统复用给别的程序 = 锁属于已死的 dsh，必须判脏。
+        # 实测：强杀留下的 pid 31848 被复用成 Nahimic3.exe，
+        # 旧判据只看 pid_alive → 误判"正常锁"→ 不清 → 新 dsh 抢锁失败崩。
+        stale, why = dsh_env.lock_is_stale(f3, {me: "nahimic3.exe"})
+        expect(stale, "PID 被复用为非 node 程序应判脏，实际 %r" % why)
+
+        # 查不到映像名（tasklist 失败/进程刚退出）→ 保守放过，
+        # 绝不许把活 dsh 的锁当脏锁删掉
+        stale, why = dsh_env.lock_is_stale(f3, {})
+        expect(not stale, "映像名查不到时应保守放过（不误删活锁），实际 %r" % why)
 
         f4 = os.path.join(d, "e.lock")
         open(f4, "w", encoding="utf-8").write(json.dumps({"no": "pid"}))
@@ -576,8 +599,8 @@ def t_split_win():
     cases = [
         (r'"C:\Program Files\nodejs\pnpm.cmd" dsh web',
          [r"C:\Program Files\nodejs\pnpm.cmd", "dsh", "web"]),
-        (r"C:\Users\26672\AppData\Roaming\npm\pnpm.cmd dsh web",
-         [r"C:\Users\26672\AppData\Roaming\npm\pnpm.cmd", "dsh", "web"]),
+        (r"C:\Users\demo-user\AppData\Roaming\npm\pnpm.cmd dsh web",
+         [r"C:\Users\demo-user\AppData\Roaming\npm\pnpm.cmd", "dsh", "web"]),
         (r'"C:\my tools\run.cmd" --profile web --port 3080',
          [r"C:\my tools\run.cmd", "--profile", "web", "--port", "3080"]),
         ('node "apps\\cli\\lib\\bin.js" web',
@@ -592,7 +615,7 @@ def t_split_win():
     got = dsh_env.split_win_cmdline(r'"C:\Program Files\a\b.cmd" x')
     expect(not any('"' in p for p in got), "结果里不应残留引号：%r" % (got,))
     # 关键性质：反斜杠必须保留（shlex(posix=True) 会全丢）
-    expect(r"C:\Users\26672\x.cmd" in got[0] or "\\" in got[0],
+    expect(r"C:\Users\demo-user\x.cmd" in got[0] or "\\" in got[0],
            "反斜杠必须保留：%r" % (got,))
 
 
@@ -650,6 +673,101 @@ def t_clean_lock_gate():
         dsh_env._netstat_cache["ok"] = real_ok
 
 
+@case("clean_stale_locks：PID 被复用给非 node 的锁必须清掉（2026-09-20 真故障）")
+def t_clean_lock_pid_reuse():
+    """端到端复现用户实际踩到的故障。
+
+    强杀 dsh 留下的锁记着 pid X，系统把 X 复用给了别的程序
+    （实测：31848 → Nahimic3.exe）。旧逻辑只看 `pid_alive` → 判「锁正常」
+    → 启动器跳过清锁 → 新 dsh 抢 task-board 锁失败
+    → `plugin tree failed to load: failed to apply loader entry ui-task-board`
+    → dsh 退出码 1（用户看到的就是「第 1 次尝试直接崩」）。
+
+    本用例在 temp 里伪造整套环境，验证新逻辑能认出来并清掉，
+    且备份里的 token 已脱敏。
+    """
+    d = tempfile.mkdtemp(prefix="dsh_t_lockreuse_")
+    real = {}
+    for k in ("DSH_STATE", "netstat_table", "is_dsh_here",
+              "dsh_running_any_port", "image_names"):
+        real[k] = getattr(dsh_env, k)
+    real_ok = dsh_env._netstat_cache.get("ok", True)
+    try:
+        sub = os.path.join(d, "task-board")
+        os.makedirs(sub, exist_ok=True)
+        fp = os.path.join(sub, "ledger-v2.lock")
+        me = os.getpid()
+        with open(fp, "w", encoding="utf-8") as f:
+            json.dump({"pid": me, "token": "SUPER-SECRET-TOKEN"}, f)
+        # mtime 拨到 10 秒前，绕开 _too_fresh（那是保护「正在写入的活锁」的）
+        old = time.time() - 10
+        os.utime(fp, (old, old))
+
+        dsh_env.DSH_STATE = d
+        dsh_env.netstat_table = lambda *a, **k: dsh_env._netstat_cache.get("rows", [])
+        dsh_env._netstat_cache["ok"] = True          # netstat 探测成功
+        dsh_env.is_dsh_here = lambda p: False        # 没有 dsh 在跑
+        dsh_env.dsh_running_any_port = lambda: False
+        dsh_env.image_names = lambda: {str(me): "nahimic3.exe"}   # ← PID 被复用
+
+        msgs = []
+        got = dsh_env.clean_stale_locks(log=msgs.append)
+
+        expect(len(got) == 1,
+               "PID 复用的脏锁必须被清理，实际 cleaned=%r，日志=%r" % (got, msgs))
+        expect(not os.path.exists(fp), "锁文件应已被删除")
+        baks = [f for f in os.listdir(sub) if ".bak-stale-" in f]
+        expect(len(baks) == 1, "删除前必须留一份备份，实际 %r" % (baks,))
+        body = open(os.path.join(sub, baks[0]), "rb").read().decode("utf-8", "replace")
+        expect("SUPER-SECRET-TOKEN" not in body, "备份里的 token 必须已脱敏")
+        expect("<redacted>" in body, "备份应含 <redacted> 占位，实际 %r" % body)
+    finally:
+        for k, v in real.items():
+            setattr(dsh_env, k, v)
+        dsh_env._netstat_cache["ok"] = real_ok
+        shutil.rmtree(d, ignore_errors=True)
+
+
+@case("clean_stale_locks：pid 是活 node 时不许清（防误删活 dsh 的锁）")
+def t_clean_lock_live_node_guard():
+    """反向守护：如果锁记的 pid 确实是活着的 node.exe，绝不能清。
+
+    这是「宁可漏判一轮，也不能误删活锁」的红线在端到端链路上的体现。
+    """
+    d = tempfile.mkdtemp(prefix="dsh_t_locklive_")
+    real = {}
+    for k in ("DSH_STATE", "netstat_table", "is_dsh_here",
+              "dsh_running_any_port", "image_names"):
+        real[k] = getattr(dsh_env, k)
+    real_ok = dsh_env._netstat_cache.get("ok", True)
+    try:
+        sub = os.path.join(d, "task-board")
+        os.makedirs(sub, exist_ok=True)
+        fp = os.path.join(sub, "ledger-v2.lock")
+        me = os.getpid()
+        with open(fp, "w", encoding="utf-8") as f:
+            json.dump({"pid": me, "token": "t"}, f)
+        old = time.time() - 10
+        os.utime(fp, (old, old))
+
+        dsh_env.DSH_STATE = d
+        dsh_env.netstat_table = lambda *a, **k: dsh_env._netstat_cache.get("rows", [])
+        dsh_env._netstat_cache["ok"] = True
+        dsh_env.is_dsh_here = lambda p: False
+        dsh_env.dsh_running_any_port = lambda: False
+        dsh_env.image_names = lambda: {str(me): "node.exe"}       # ← 活的 node
+
+        msgs = []
+        got = dsh_env.clean_stale_locks(log=msgs.append)
+        expect(got == [], "活 node 的锁不该被清，实际 %r" % (got,))
+        expect(os.path.exists(fp), "锁文件必须还在")
+    finally:
+        for k, v in real.items():
+            setattr(dsh_env, k, v)
+        dsh_env._netstat_cache["ok"] = real_ok
+        shutil.rmtree(d, ignore_errors=True)
+
+
 @case("live_now：端口集合必须覆盖实际配置端口（不止 3080/3081/3082）")
 def t_live_now_ports():
     import importlib.util as _ilu
@@ -684,6 +802,177 @@ def t_live_now_ports():
     finally:
         dsh_env.is_dsh_here = real
 
+
+
+# ============================================================
+# 9. 2026-09-19 安全审查修复守护（T1/T2/F2/F4/F7/F8/T9/T11）
+# ============================================================
+def _load_launcher(name):
+    import importlib.util as _ilu
+    _s = _ilu.spec_from_file_location(name, os.path.join(T, 'dsh-launcher.py'))
+    L = _ilu.module_from_spec(_s)
+    _s.loader.exec_module(L)
+    return L
+
+
+@case("实例互斥：二拿被拒、释放后可再拿、死 pid 残锁自愈（T1/F11）")
+def t_instance_mutex():
+    L = _load_launcher('dsh_launcher_mut')
+    lock = os.path.join(tempfile.mkdtemp(prefix="dsh_t_mut_"), "lock")
+    real_lock, real_log = L.INSTANCE_LOCK, L.log
+    L.INSTANCE_LOCK = lock
+    L.log = lambda m: None
+    try:
+        expect(L.acquire_instance_lock() is True, "首拿应成功")
+        expect(os.path.exists(lock), "锁文件应存在")
+        expect(L.acquire_instance_lock() is False, "二拿应被拒")
+        L.release_instance_lock()
+        expect(not os.path.exists(lock), "释放后锁应消失")
+        # 上次崩溃的残锁：记录的 pid 已死 → 清掉重拿成功
+        open(lock, "w").write("999999")
+        expect(L.acquire_instance_lock() is True, "死 pid 残锁应自愈重拿")
+        L.release_instance_lock()
+        # 活 pid 残锁：必须拒绝（真有另一实例在跑）
+        open(lock, "w").write(str(os.getpid()))
+        expect(L.acquire_instance_lock() is False, "活 pid 残锁应被拒")
+        L.release_instance_lock()
+    finally:
+        L.INSTANCE_LOCK = real_lock
+        L.log = real_log
+        try:
+            os.remove(lock)
+        except OSError:
+            pass
+
+
+@case("kill_leftover：taskkill 超时/失败不炸流程，只记日志（T2/F1）")
+def t_kill_guard():
+    L = _load_launcher('dsh_launcher_k')
+    env = {"port": {"value": 3080, "source": "t", "alive": True}}
+    real = (L.find_live_ports, L.dsh_env.verified_listening_pids,
+            L.dsh_env.pid_is_node, L.dsh_env.image_names, L.log)
+    logs = []
+    try:
+        L.find_live_ports = lambda e: [3080]
+        L.dsh_env.verified_listening_pids = lambda p: {4321}
+        L.dsh_env.pid_is_node = lambda pid, names=None: True
+        L.dsh_env.image_names = lambda: {}
+        L.log = logs.append
+
+        class _Boom:
+            @staticmethod
+            def run(*a, **k):
+                raise subprocess.TimeoutExpired(cmd="taskkill", timeout=30)
+        real_sub = L.subprocess
+        L.subprocess = _Boom
+        try:
+            killed = L.kill_leftover(env)   # 旧版在这里 TimeoutExpired 炸穿
+        finally:
+            L.subprocess = real_sub
+        expect(killed == [], "超时不应记入 killed")
+        expect(any("taskkill" in m and "失败" in m for m in logs),
+               "应打印 taskkill 失败提示：%r" % (logs,))
+    finally:
+        (L.find_live_ports, L.dsh_env.verified_listening_pids,
+         L.dsh_env.pid_is_node, L.dsh_env.image_names, L.log) = real
+
+
+@case("清锁新鲜度+脱敏：mtime<5s 不删、老死锁照清、备份 token 指纹化（F2/F4）")
+def t_clean_lock_fresh():
+    d = tempfile.mkdtemp(prefix="dsh_t_fresh_")
+    real = (dsh_env.DSH_STATE, dsh_env._netstat_cache.get("ok", True),
+            dsh_env.is_dsh_here, dsh_env.dsh_running_any_port)
+    try:
+        dsh_env.DSH_STATE = d
+        dsh_env._netstat_cache["ok"] = True
+        dsh_env.is_dsh_here = lambda p: False
+        dsh_env.dsh_running_any_port = lambda: False
+        sub = os.path.join(d, "task-board")
+        os.makedirs(sub)
+        fresh = os.path.join(sub, "fresh.lock")
+        open(fresh, "wb").close()                      # 0 字节 + mtime 刚刚
+        old = os.path.join(sub, "old.lock")
+        open(old, "w", encoding="utf-8").write(
+            json.dumps({"pid": 999999, "token": "secret-value"}))
+        old_ts = time.time() - 7200
+        os.utime(old, (old_ts, old_ts))
+        cleaned = dsh_env.clean_stale_locks(log=lambda m: None)
+        expect(os.path.exists(fresh), "新鲜锁（0 字节但 mtime 刚刚）绝不能删")
+        expect(not os.path.exists(old), "老死锁应被清理")
+        baks = [x for x in os.listdir(sub) if x.startswith("old.lock.bak-stale-")]
+        expect(len(baks) == 1, "应恰好 1 份备份：%r" % (os.listdir(sub),))
+        data = open(os.path.join(sub, baks[0]), "rb").read()
+        expect(b"secret-value" not in data, "备份里的 token 必须已脱敏")
+        expect(b"<redacted>" in data, "token 应替换为 <redacted>：%r" % data)
+        expect(len(cleaned) == 1 and cleaned[0][0].endswith("old.lock"),
+               "清理清单应只含 old.lock：%r" % (cleaned,))
+    finally:
+        (dsh_env.DSH_STATE, dsh_env._netstat_cache["ok"],
+         dsh_env.is_dsh_here, dsh_env.dsh_running_any_port) = real
+        shutil.rmtree(d, ignore_errors=True)
+
+
+@case("set_disabled：不安全 eid（YAML 指示符/空白/控制符）拒绝且不写（F8）")
+def t_eid_guard():
+    tmp = tempfile.mkdtemp(prefix="dsh_t_eid_")
+    try:
+        p = _copy_patch(tmp)
+        before = open(p, "rb").read()
+        for bad in ("*x", "|", "a b", "x\ny", "!x", "&x", "{x}"):
+            ok, note = dsh_plugins.set_disabled(p, bad, True)
+            expect(ok is False, "eid %r 应被拒绝：%s" % (bad, note))
+        expect(open(p, "rb").read() == before, "被拒后文件必须原封不动")
+    finally:
+        shutil.rmtree(tmp, ignore_errors=True)
+
+
+@case("split_win_cmdline：空参数 / Unicode 空白 / 中缀引号 / 空输入（T11）")
+def t_split_win_edge():
+    expect(dsh_env.split_win_cmdline('prog "" x') == ["prog", "", "x"],
+           "独立 \"\" 是空参数，实得 %r" % (dsh_env.split_win_cmdline('prog "" x'),))
+    got = dsh_env.split_win_cmdline('foo"bar baz"qux')
+    expect(got == ["foobar bazqux"],
+           "中缀引号不该切断 token，实得 %r" % (got,))
+    got = dsh_env.split_win_cmdline("a" + chr(0xa0) + "b c")
+    expect(got == ["a" + chr(0xa0) + "b", "c"],
+           "NBSP 不是分隔符（旧版 isspace 会切碎），实得 %r" % (got,))
+    expect(dsh_env.split_win_cmdline("") == [], "空输入应得空列表")
+    expect(dsh_env.split_win_cmdline("   ") == [], "纯空白应得空列表")
+
+
+@case("dump 缓存：内容与 meta 长度不符必须弃用重取（T9/F12）")
+def t_dumpcache_size():
+    d = tempfile.mkdtemp(prefix="dsh_t_dmp_")
+    repo = os.path.join(d, "repo")
+    os.makedirs(repo)
+    open(os.path.join(repo, "package.json"), "w", encoding="utf-8").write("{}")
+    prof = os.path.join(d, "profiles", "web")
+    os.makedirs(prof)
+    open(os.path.join(prof, "package.json"), "w", encoding="utf-8").write("{}")
+    real = (dsh_env.DUMPC, dsh_env.DSH_STATE, dsh_env._run)
+    notes = []
+    try:
+        dsh_env.DUMPC = os.path.join(d, "dump.txt")
+        dsh_env.DSH_STATE = d
+        calls = {"n": 0}
+
+        def fake_run(argv, **k):
+            calls["n"] += 1
+            return 0, ("LINE-%d " % calls["n"]) * 40, ""   # >200 字符
+
+        dsh_env._run = fake_run
+        t1 = dsh_env.dump_config(repo, "web", notes)
+        expect(t1 and "LINE-1" in t1, "首次应真取并返回 LINE-1")
+        # 模拟「半截写入」：缓存被截断，meta 仍是旧指纹
+        with open(dsh_env.DUMPC, "w", encoding="utf-8") as f:
+            f.write("GARBAGE")
+        t2 = dsh_env.dump_config(repo, "web", notes)
+        expect(t2 and "GARBAGE" not in t2,
+               "长度不符的缓存必须弃用（旧版会把 GARBAGE 当权威树）")
+        expect(t2 and "LINE-2" in t2, "弃用后应重新取数，实得 %r" % (t2 or "")[:50])
+    finally:
+        dsh_env.DUMPC, dsh_env.DSH_STATE, dsh_env._run = real
+        shutil.rmtree(d, ignore_errors=True)
 
 
 # ============================================================

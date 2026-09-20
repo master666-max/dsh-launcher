@@ -40,7 +40,8 @@ try:
 except Exception:
     pass
 
-_re_id   = _re_mod.compile(r"^- id:\s*([^\s]+)\s*$")
+# [!] id 捕获整段剩余（旧版 [^\s]+ 会把 `- id: a b` 这类含空格 id 整行丢掉）
+_re_id   = _re_mod.compile(r"^- id:\s*(.+?)\s*$")
 _re_name = _re_mod.compile(r"^name:\s*(.+)$")
 _re_dis  = _re_mod.compile(r"^disabled:\s*(.+)$")
 
@@ -62,15 +63,27 @@ def pinned_env():
     return env
 
 
-def _run(argv, timeout=30, cwd=None, pin=True):
-    """永不抛异常的 subprocess.run；默认带 PATH 钉扎。"""
+def _run(argv, timeout=30, cwd=None, pin=True, try_utf8=False):
+    """永不抛异常的 subprocess.run；默认带 PATH 钉扎。
+
+    try_utf8=True：输出先按 UTF-8 严格解码、失败再退 GBK —— 专给 node
+    子进程用（dump-config 输出是 UTF-8），避免非 ASCII 入口 id 变乱码
+    导致「切换显示 [OK] 实为空操作」；netstat/tasklist 等系统工具仍走 GBK。
+    """
+    def dec(b):
+        b = b or b""
+        if try_utf8:
+            try:
+                return b.decode("utf-8")
+            except UnicodeDecodeError:
+                pass
+        return b.decode("gbk", "replace")
+
     try:
         r = subprocess.run(argv, capture_output=True, timeout=timeout, cwd=cwd,
                            env=pinned_env() if pin else None,
                            creationflags=FLAGS)
-        return (r.returncode,
-                (r.stdout or b"").decode("gbk", "replace"),
-                (r.stderr or b"").decode("gbk", "replace"))
+        return (r.returncode, dec(r.stdout), dec(r.stderr))
     except Exception as e:
         return -1, "", str(e)
 
@@ -92,17 +105,23 @@ def _read_text(p):
 
 
 def load_config():
-    """读 dsh-config.json；缺字段一律 None = 自动探测。"""
+    """读 dsh-config.json；缺字段/类型不对一律 None = 自动探测。
+
+    [!] 每个字段都必须验类型 —— 配置是手编文件，`start_command: 123` 这类
+        笔记曾一路炸到探测层把菜单打崩。
+    """
     c = _read_json(CFG) or {}
     if not isinstance(c, dict):
         c = {}
+    pc = c.get("port_candidates")
     return {
-        "repo": c.get("repo") or None,
-        "profile": c.get("profile") or None,
+        "repo": c.get("repo") if isinstance(c.get("repo"), str) else None,
+        "profile": c.get("profile") if isinstance(c.get("profile"), str) else None,
         "port": c.get("port") if isinstance(c.get("port"), int) else None,
-        "start_command": c.get("start_command") or None,
-        "port_candidates": [p for p in (c.get("port_candidates") or [])
-                            if isinstance(p, int)],
+        "start_command": c.get("start_command")
+                         if isinstance(c.get("start_command"), str) else None,
+        "port_candidates": [p for p in pc if isinstance(p, int)]
+                           if isinstance(pc, list) else [],
     }
 
 
@@ -159,6 +178,19 @@ def list_pkgs(root):
     return out
 
 
+# ============================ cmd.exe 安全闸 ============================
+# cmd 对【引号内】参数仍做 %VAR% 展开（本机实测），且 & | < > ^ ! " 与
+# 控制字符任何一个都会改变命令语义（0x1A 还会静默终止 cmd 的 stdin 读取）。
+# 凡送进 cmd.exe（参数列表或 stdin 脚本）的路径/名字必须先过这道闸；
+# 不过闸的条目跳过并记日志，绝不硬拼。
+_CMD_UNSAFE = _re_mod.compile(r"[\x00-\x1f\x7f%&|<>^!\"]")
+
+
+def cmd_arg_safe(p):
+    """路径/名字能否安全送进 cmd.exe（参数列表或 stdin 脚本）。"""
+    return isinstance(p, str) and _CMD_UNSAFE.search(p) is None
+
+
 # ============================ 进程 / 端口 ============================
 _netstat_cache = {"ts": 0.0, "rows": [], "ok": True}
 _netstat_lock = threading.Lock()
@@ -202,8 +234,18 @@ def listening_ports():
 
 
 def listening_pids(port):
-    """占用该端口（LISTENING）的 PID 集合。"""
+    """占用该端口（LISTENING）的 PID 集合（可能来自 ≤3 秒的缓存快照）。"""
     return {r["pid"] for r in netstat_table() if r["port"] == port}
+
+
+def verified_listening_pids(port):
+    """击杀专用：强制刷新 netstat 后再取端口 PID。
+
+    [!] 绝不在 ≤3 秒的陈旧快照上动手 —— 旧表里的 PID 可能已被系统复用，
+        后续任何 pid_is_node 复核都救不回「一开始就查错了人」。
+    """
+    netstat_table(refresh=True)
+    return listening_pids(port)
 
 
 def image_names():
@@ -266,7 +308,7 @@ def pid_alive(pid):
         return None
 
 
-def _probe_http(port, timeout=3):
+def _probe_http(port, timeout=1):
     c = http.client.HTTPConnection("127.0.0.1", port, timeout=timeout)
     try:
         c.request("GET", "/")
@@ -338,11 +380,23 @@ def pid_alive_guard(pid):
     return pid_alive(pid)
 
 
-def lock_is_stale(fp):
-    """锁文件是否为脏。三种情形都算：
+def lock_is_stale(fp, names=None):
+    """锁文件是否为脏。四种情形都算：
       ① 0 字节；② 内容不是合法 JSON（残片）；
-      ③ 合法 JSON 但里面记录的 pid 已经死了（强杀后最常留下的形态）。
+      ③ 合法 JSON 但里面记录的 pid 已经死了（强杀后最常留下的形态）；
+      ④ 合法 JSON、pid 也活着，但**那个 pid 已被系统复用给别的程序**（不是 node.exe）。
     返回 (是否脏, 原因)。
+
+    [!] ④ 是 2026-09-20 补的，此前的漏判会造成真实故障：
+        强杀 dsh 留下的锁记着 pid 31848，系统把该 PID 复用给了
+        Nahimic3.exe（音频驱动）→ 只按 ①②③ 判会得出「pid 还活着 = 锁正常」
+        → 启动器跳过清锁 → 新 dsh 抢 task-board 锁失败 →
+        `plugin tree failed to load: failed to apply loader entry ui-task-board`
+        → 整个 dsh 退出码 1。用户看到的就是「第 1 次尝试直接崩」。
+
+    [!] 判据从严：只在【明确查到映像名、且不是 node.exe】时才判脏。
+        查不到映像名（tasklist 失败/进程刚好退出）时一律保守放过 ——
+        宁可漏判一轮，也绝不给「把活 dsh 的锁当脏锁删掉」留机会。
     """
     try:
         size = os.path.getsize(fp)
@@ -358,9 +412,18 @@ def lock_is_stale(fp):
         return True, "内容不是合法 JSON"
 
     if isinstance(data, dict) and "pid" in data:
-        alive = pid_alive(data.get("pid"))
+        pid = data.get("pid")
+        alive = pid_alive(pid)
         if alive is False:
-            return True, "记录的 pid %s 已不存在" % data.get("pid")
+            return True, "记录的 pid %s 已不存在" % pid
+        if alive is True:
+            # names 允许调用方传入（批量扫描时复用一次 tasklist）
+            if names is None:
+                names = image_names()
+            actual = names.get(str(pid))
+            if actual is not None and actual.lower() != "node.exe":
+                return True, ("记录的 pid %s 已被系统复用为 %s（非 node）"
+                              "—— 该锁属于已死的 dsh" % (pid, actual))
     return False, "看起来是正常锁"
 
 
@@ -368,30 +431,74 @@ def dsh_running_any_port():
     """有没有 dsh 在【任意】端口上跑（不只候选端口）。
 
     不能只看候选端口 —— dsh-mobile 的网关在 3443，光看 3080 会漏。
-    做法：node.exe 监听的端口 → 挨个探活（并行）。
+    做法：node.exe 监听的端口 → 并行探活，【首中即返】。
+    [!] 旧实现用 `with ThreadPoolExecutor` + ex.map，提前 return 也要在
+        __exit__ 里等全部 future 收尾 —— 端口多时白等十几秒，用户以为死机。
     """
     ports = node_listening_ports()
     if not ports:
         return False
-    from concurrent.futures import ThreadPoolExecutor
+    from concurrent.futures import ThreadPoolExecutor, as_completed
+    ex = ThreadPoolExecutor(max_workers=8)
     try:
-        with ThreadPoolExecutor(max_workers=8) as ex:
-            for hit in ex.map(is_dsh_here, ports):
-                if hit:
+        futs = [ex.submit(is_dsh_here, p) for p in ports]
+        try:
+            for f in as_completed(futs):
+                if f.result():
                     return True
-    except Exception:
-        return True          # 探不动时按「在跑」处理：宁可不清理，不能误删
-    return False
+            return False
+        except Exception:
+            return True      # 探不动时按「在跑」处理：宁可不清理，不能误删
+    finally:
+        # 不等收尾：剩余探测直接取消，调用方立刻拿到结论
+        ex.shutdown(wait=False, cancel_futures=True)
+
+
+def _too_fresh(fp, max_age=5.0):
+    """锁文件 mtime 距今不足 max_age 秒 = 可能正被 dsh 写入，绝不碰。
+
+    并发启动的 dsh 写锁的瞬间就是 0 字节/半截 JSON —— 恰好命中判脏条件。
+    摸不到 mtime 时按「新鲜」处理（宁可漏一轮，不能误删活锁）。
+    """
+    try:
+        return (time.time() - os.path.getmtime(fp)) < max_age
+    except OSError:
+        return True
+
+
+def _lock_backup_name(fp):
+    """锁备份名：带毫秒与 pid —— 同一秒内两次清理不再互相覆盖。"""
+    return "%s.bak-stale-%s-%d-%d" % (fp, time.strftime("%Y%m%d-%H%M%S"),
+                                      int(time.time() * 1000) % 1000000,
+                                      os.getpid())
+
+
+def _backup_lock_redacted(fp, bak):
+    """复制锁文件到备份，但把 JSON 里的 token 值替换为占位符。
+
+    [!] 锁内容含会话 token（真凭据）—— 备份只为排查看结构，凭据不许落盘。
+        含 token 键却一次都没替换成功（结构出乎意料）→ 抛错放弃备份与删除。
+    """
+    with open(fp, "rb") as f:
+        raw = f.read()
+    scrubbed, n = _re_mod.subn(rb'"token"\s*:\s*"[^"]*"',
+                               b'"token":"<redacted>"', raw)
+    if b"token" in raw.lower() and n == 0:
+        raise ValueError("token 字段未能清洗，放弃备份")
+    with open(bak, "wb") as f:
+        f.write(scrubbed)
 
 
 def clean_stale_locks(log=None):
     """清掉「强杀」留下的脏锁。返回 [(子路径, 原因)]。
 
-    三重把关（缺一不可）：
-      ① 任意端口上都没有 dsh 在跑（先查候选端口，再全端口兜底）；
+    把关（缺一不可）：
+      ① 任意端口上都没有 dsh 在跑（先查候选端口，再全端口兜底），
+         且 netstat 本身必须成功（失败 ≠ 没有监听）；
       ② 文件位于 ~/.dsh/<子目录>/ 且以 .lock 结尾；
-      ③ lock_is_stale 判定为脏（0 字节 / 畸形 / dead-PID）。
-    删除前一定先备份；备份只保留最近 5 份。
+      ③ mtime 距今 ≥ 5 秒（正在写入的活锁就是 0 字节，恰好会判脏）；
+      ④ lock_is_stale 判定为脏（0 字节 / 畸形 / dead-PID / **PID 被复用**）。
+    删除前一定先备份（token 已脱敏）；每把锁只保留最近 5 份备份。
     """
     def _log(m):
         (log or print)(m)
@@ -413,6 +520,15 @@ def clean_stale_locks(log=None):
         return []
 
     cleaned = []
+    # 惰性取一次 PID→映像名 映射：只有真遇到「pid 还活着」的锁才跑 tasklist，
+    # 目录里没有活 pid 锁时零开销。
+    _names_cache = {}
+
+    def _names():
+        if not _names_cache:
+            _names_cache.update(image_names())
+        return _names_cache
+
     try:
         subs = os.listdir(root)
     except OSError:
@@ -428,28 +544,41 @@ def clean_stale_locks(log=None):
         for fn in files:
             if not fn.endswith(".lock"):
                 continue
+            # 每删一批前再确认一次没有 dsh 起来（扫描可能耗时数秒，
+            # 期间用户完全可能双击了启动器）
+            if len(cleaned) and len(cleaned) % 10 == 0:
+                if is_dsh_here(DEFAULT_PORTS[0]) or dsh_running_any_port():
+                    _log("  [!] 扫描期间检测到 dsh 启动 —— 立即中止清锁")
+                    return cleaned
             fp = os.path.join(d, fn)
-            stale, why = lock_is_stale(fp)
+            if _too_fresh(fp):
+                continue
+            stale, why = lock_is_stale(fp, _names())
             if not stale:
                 continue
-            bak = fp + ".bak-stale-" + time.strftime("%Y%m%d-%H%M%S")
+            bak = _lock_backup_name(fp)
             try:
-                shutil.copy2(fp, bak)
+                _backup_lock_redacted(fp, bak)
                 os.remove(fp)
                 cleaned.append((sub + "/" + fn, why))
-                _log("  [清理] 脏锁 %s/%s（%s，已备份）" % (sub, fn, why))
+                _log("  [清理] 脏锁 %s/%s（%s，已脱敏备份）" % (sub, fn, why))
             except Exception as e:
                 _log("  [!] 无法清理 %s/%s：%s" % (sub, fn, e))
 
-    # 备份轮转：只保留最近 5 份
+    # 备份轮转：按【每把锁】保留最近 5 份（旧版整目录混着数，
+    # 多锁同目录时会清掉 A 的唯一备份而留 B 的 5 份）
     try:
         for sub2 in os.listdir(root):
             d2 = os.path.join(root, sub2)
             if not os.path.isdir(d2):
                 continue
-            olds = sorted(glob.glob(os.path.join(d2, "*.bak-stale-*")))
-            for o in olds[:-5]:
-                os.remove(o)
+            groups = {}
+            for b in glob.glob(os.path.join(d2, "*.bak-stale-*")):
+                key = os.path.basename(b).split(".bak-stale-")[0]
+                groups.setdefault(key, []).append(b)
+            for paths in groups.values():
+                for old in sorted(paths)[:-5]:
+                    os.remove(old)
     except Exception:
         pass
     return cleaned
@@ -463,8 +592,8 @@ def _score_repo(p):
     if not os.path.isdir(p):
         return -9999, ["不是目录"]
     pj = _read_json(os.path.join(p, "package.json"))
-    if not pj:
-        return -9999, ["无 package.json"]
+    if not isinstance(pj, dict):
+        return -9999, ["无 package.json 或不是 JSON 对象"]
 
     score, why = 0, []
     name = str(pj.get("name") or "")
@@ -547,7 +676,9 @@ def find_repo(cfg, notes):
         notes.append("另有 %d 个可信候选未采用：%s"
                      % (len(others), ", ".join(os.path.basename(o[1]) for o in others[:4])))
 
-    pj = _read_json(os.path.join(top[1], "package.json")) or {}
+    pj = _read_json(os.path.join(top[1], "package.json"))
+    if not isinstance(pj, dict):
+        pj = {}
     return {"path": top[1], "score": top[0], "source": top[2],
             "version": pj.get("version"), "why": top[3],
             "candidates": [(r[0], r[1]) for r in ranked[:5]]}
@@ -590,7 +721,9 @@ def find_profile(cfg, notes):
     if patch is None:
         notes.append("profile 里没有 cordis 补丁文件（插件启停会不可用）")
 
-    pj = _read_json(os.path.join(pdir, "package.json")) or {}
+    pj = _read_json(os.path.join(pdir, "package.json"))
+    if not isinstance(pj, dict):
+        pj = {}
     prof = ((pj.get("dsh") or {}).get("profile") or {})
     bundles = prof.get("bundles")
     has_bundles = isinstance(bundles, list) and len(bundles) > 0
@@ -678,31 +811,33 @@ def split_win_cmdline(s):
     Windows 的规则与 POSIX 不同：
       * `"` 只用来**分组**（让空格属于同一个参数），不是转义字符，分组后要去掉；
       * `\\` 是普通路径分隔符，**绝不能**像 shlex(posix=True) 那样吞掉；
-      * 反斜杠只有在**紧贴引号**时才可能充当转义（`\\"` 表示字面引号），
-        本场景（路径 + 子命令）用不到，故一律当普通字符。
+      * 独立的 `""` 是一个**空参数**（旧版会把它吞掉导致位置参数错位）；
+      * 只按 ASCII 空格/制表切分 —— `\\xa0` 等 Unicode 空白 cmd 并不当分隔符，
+        旧版用 ch.isspace() 会把 `C:\\x\\xa0y` 这类名字切碎。
 
     三个反例（本机实测）：
         "C:\\Program Files\\nodejs\\pnpm.cmd" dsh web
           .split()                 → ['"C:\\Program', 'Files\\nodejs\\pnpm.cmd"', ...]  切碎
           shlex.split(posix=False) → ['"C:\\Program Files\\nodejs\\pnpm.cmd"', ...]     引号残留
           shlex.split(posix=True)  → ['C:\\Program Files\\nodejs\\pnpm.cmd', ...]       ← 这个恰好对
-        C:\\Users\\26672\\...\\pnpm.cmd dsh web
-          shlex.split(posix=True)  → ['C:Users26672...pnpm.cmd', ...]                  反斜杠全丢
+        C:\\Users\\<user>\\...\\pnpm.cmd dsh web
+          shlex.split(posix=True)  → ['C:Users<user>...pnpm.cmd', ...]                 反斜杠全丢
     所以两者都不能单用，这里自己实现，两组用例都正确。
     """
-    out, cur, in_q = [], [], False
+    out, cur, in_q, has_q = [], [], False, False
     for ch in s:
         if ch == '"':
             in_q = not in_q                 # 引号只切换分组状态，本身不保留
-        elif ch.isspace() and not in_q:
-            if cur:
+            has_q = True
+        elif ch in (" ", "\t") and not in_q:
+            if cur or has_q:                # has_q 且 cur 空 = 独立 "" 空参数
                 out.append("".join(cur))
-                cur = []
+            cur, has_q = [], False
         else:
             cur.append(ch)
-    if cur:
+    if cur or has_q:
         out.append("".join(cur))
-    return out or [s]
+    return out
 
 
 def discover_start_cmds(repo, profile_name, cfg, notes):
@@ -713,26 +848,46 @@ def discover_start_cmds(repo, profile_name, cfg, notes):
     """
     out, seen = [], set()
 
-    def push(label, argv):
+    def push(label, argv, cmdline=None):
         if label not in seen:
             seen.add(label)
-            out.append({"label": label, "argv": argv})
+            item = {"label": label, "argv": argv}
+            if cmdline:
+                item["cmdline"] = cmdline   # 启动器须以【字符串命令行】执行它
+            out.append(item)
 
     if cfg.get("start_command"):
-        # [!] 三种切法都不对，必须用自带的 split_win_cmdline：
-        #       .split()                → 带空格路径被切碎
-        #       shlex.split(posix=False)→ 保住反斜杠，但**引号也留着**，
-        #                                 送进 cmd.exe 会被当成命令名的一部分 → 找不到命令
-        #       shlex.split(posix=True) → 引号去掉了，但**吃掉所有反斜杠** → 路径全毁
-        #     正解：去引号 + 保留反斜杠 + 保留空格（见该函数注释）
-        push(cfg["start_command"],
-             ["cmd.exe", "/c"] + split_win_cmdline(cfg["start_command"]))
+        parts = split_win_cmdline(cfg["start_command"])
+        first = parts[0] if parts else ""
+        if first and os.path.isfile(first):
+            # [!] 首段是真实文件 → 绕开 cmd /c 直接以列表参数启动。
+            #     cmd /c 对「≥4 个引号」的命令行会剥掉首尾引号，把
+            #     `"C:\my prog\x.cmd" --title "my h"` 截成命令名 `C:\my`。
+            push("%s（直接启动）" % cfg["start_command"], parts)
+        elif parts:
+            # [!] 其余形式走 cmd /s /c，且必须给启动器【字符串命令行】——
+            #     列表参数会被 list2cmdline 把内部引号转义成 \" ，cmd /s
+            #     剥掉外层引号后命令名带上 \" 前缀照样失败。手工整体外引号
+            #     才能让 cmd 剥完外层后得到原始命令。
+            push(cfg["start_command"], ["cmd.exe", "/s", "/c"],
+                 cmdline='cmd.exe /s /c "%s"' % cfg["start_command"])
+        else:
+            notes.append("start_command 是空白，忽略")
 
     if not repo or not os.path.isdir(repo):
         return out
 
     pm = pkg_manager(repo)
     prof = profile_name or "web"
+    # [!] profile 名是 os.listdir 出来的目录名 —— 带 cmd 元字符的名字拼进
+    #     `--profile x&calc` 会被 cmd 当成第二条命令执行；不安全就只用
+    #     默认的 web 形式，绝不让脏名字进 argv
+    if not cmd_arg_safe(prof):
+        notes.append("profile 名含 cmd 元字符，--profile 形式候选跳过：%r" % prof)
+        prof = "web"
+        prof_ok = False
+    else:
+        prof_ok = True
 
     rc, help_out, _ = _run(["cmd.exe", "/c", pm, "dsh", "--help"],
                            timeout=90, cwd=repo)
@@ -749,7 +904,7 @@ def discover_start_cmds(repo, profile_name, cfg, notes):
 
     if chosen:
         push("dsh %s" % chosen, ["cmd.exe", "/c", pm, "dsh", chosen])
-    if prof and prof != chosen:
+    if prof_ok and prof != chosen:
         push("dsh --profile %s %s" % (prof, chosen or "web"),
              ["cmd.exe", "/c", pm, "dsh", "--profile", prof, chosen or "web"])
 
@@ -770,14 +925,16 @@ def discover_start_cmds(repo, profile_name, cfg, notes):
         pre = prebuilt_entry(repo)
     except Exception:
         pre = None
-    if pre:
+    if pre and cmd_arg_safe(pre):
         push("node apps/cli/lib/bin.js %s（兜底：预编译入口）" % prof,
              ["cmd.exe", "/c", find_node(), pre, prof])
         notes.append("预编译入口已降为兜底候选（官方方式优先）")
+    elif pre:
+        notes.append("预编译入口路径含 cmd 元字符，跳过该兜底候选")
 
     for c in out:
         a = c["argv"]
-        if len(a) > 2 and a[0] == "cmd.exe":
+        if "cmdline" not in c and len(a) > 2 and a[0] == "cmd.exe":
             c["label"] = " ".join(a[2:])
     return out
 
@@ -791,6 +948,12 @@ def dump_config(repo, profile_name, notes, force=False, timeout=240):
         前两个 mtime 都不变，指纹若不含它，插件树会一直显示旧状态。
     """
     if not repo or not profile_name:
+        return None
+    # [!] profile 名要进 cmd.exe 的 argv —— 带 & | % 之类的目录名会在这里
+    #     变成第二条命令；不安全直接拒绝（返回 None = 降级为自行解析补丁）
+    if not cmd_arg_safe(profile_name):
+        notes.append("profile 名含 cmd 元字符，拒绝执行 --dump-config：%r"
+                     % profile_name)
         return None
 
     fp = []
@@ -815,28 +978,41 @@ def dump_config(repo, profile_name, notes, force=False, timeout=240):
     fp.append(profile_name)
     fp = "|".join(fp)
 
-    meta = _read_json(DUMPC + ".meta.json") or {}
+    meta = _read_json(DUMPC + ".meta.json")
+    if not isinstance(meta, dict):
+        meta = {}
     if not force and meta.get("fp") == fp and os.path.exists(DUMPC):
         try:
-            with open(DUMPC, encoding="utf-8") as f:
-                return f.read()
+            with open(DUMPC, "rb") as f:
+                data = f.read()
+            # [!] 长度必须与 meta 记录一致 —— 旧版只看「文件存在」，
+            #     半截写入的 dump 会被旧 meta 放行，插件树静默失真
+            if meta.get("bytes") == len(data):
+                return data.decode("utf-8", "replace")
         except Exception:
             pass
 
     pm = pkg_manager(repo)
     rc, out, err = _run(["cmd.exe", "/c", pm, "dsh", "--profile",
                          profile_name, "--dump-config"],
-                        timeout=timeout, cwd=repo)
+                        timeout=timeout, cwd=repo, try_utf8=True)
     if rc != 0 or len(out) < 200:
         notes.append("`dsh --profile %s --dump-config` 不可用（rc=%d）"
                      "，退回自行解析补丁文件" % (profile_name, rc))
         return None
 
+    # [!] 原子写：先写临时文件再 os.replace —— 直接覆写时崩溃/双实例交错
+    #     会留下半截 dump 被 meta 放行（meta 最后写，带长度校验）
     try:
-        with open(DUMPC, "w", encoding="utf-8") as f:
+        tmp = "%s.tmp-%d" % (DUMPC, os.getpid())
+        with open(tmp, "w", encoding="utf-8") as f:
             f.write(out)
-        with open(DUMPC + ".meta.json", "w", encoding="utf-8") as f:
-            json.dump({"fp": fp, "ts": time.strftime("%Y-%m-%d %H:%M:%S")}, f)
+        os.replace(tmp, DUMPC)
+        mtmp = "%s.meta.tmp-%d" % (DUMPC, os.getpid())
+        with open(mtmp, "w", encoding="utf-8") as f:
+            json.dump({"fp": fp, "bytes": len(out.encode("utf-8")),
+                       "ts": time.strftime("%Y-%m-%d %H:%M:%S")}, f)
+        os.replace(mtmp, DUMPC + ".meta.json")
     except Exception:
         pass
     notes.append("已用 `--dump-config` 取到权威插件树（%d 行）" % len(out.splitlines()))
@@ -858,6 +1034,9 @@ def parse_dump(text):
     for raw in text.splitlines():
         if raw.startswith("# =="):
             section = raw[4:].strip()
+            continue
+        if raw.startswith("#==="):     # 无空格的分节头也算（别把归属算错层）
+            section = raw[3:].strip()
             continue
         m = _re_id.match(raw)
         if m:
@@ -942,10 +1121,20 @@ _MEMO = {}
 
 
 def _cache_valid(c):
-    """落盘缓存是否可用：仓库/profile 还在，且仓库 package.json 没被改过。"""
-    r = ((c or {}).get("result") or {})
-    repo = (r.get("repo") or {}).get("path")
-    prof = (r.get("profile") or {}).get("dir")
+    """落盘缓存是否可用：结构是预期形状、仓库/profile 还在、仓库
+    package.json 没被改过。
+
+    [!] c 与 c["result"] 都必须 isinstance dict —— 缓存被外部改坏成
+        「合法 JSON 但顶层是列表/数字」时，旧版会 AttributeError；
+        detect 又经 probe() 被吞，菜单[1] 就误报「没定位到仓库」。
+    """
+    if not isinstance(c, dict):
+        return False
+    r = c.get("result")
+    if not isinstance(r, dict):
+        return False
+    repo = (r.get("repo") or {}).get("path") if isinstance(r.get("repo"), dict) else None
+    prof = (r.get("profile") or {}).get("dir") if isinstance(r.get("profile"), dict) else None
     if not repo or not os.path.isdir(repo):
         return False
     if not prof or not os.path.isdir(prof):
@@ -1043,9 +1232,9 @@ def report(env):
     r = env.get("repo")
     o.append("[仓库]")
     if r:
-        o.append("  路径 : %s" % r["path"])
+        o.append("  路径 : %s" % r.get("path"))
         o.append("  版本 : %s" % (r.get("version") or "?"))
-        o.append("  来源 : %s（得分 %d）" % (r["source"], r["score"]))
+        o.append("  来源 : %s（得分 %s）" % (r.get("source"), r.get("score")))
         o.append("  判据 : %s" % "; ".join(r.get("why") or []))
     else:
         o.append("  未定位到（启动不可用）")
@@ -1053,8 +1242,8 @@ def report(env):
     p = env.get("profile")
     o += ["", "[profile]"]
     if p:
-        o.append("  名称    : %s" % p["name"])
-        o.append("  目录    : %s" % p["dir"])
+        o.append("  名称    : %s" % p.get("name"))
+        o.append("  目录    : %s" % p.get("dir"))
         o.append("  补丁    : %s" % (p.get("patch_file") or "（无）"))
         o.append("  bundles : %d 个" % (p.get("bundle_count") or 0))
         if len(p.get("all_profiles") or []) > 1:

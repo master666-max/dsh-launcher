@@ -26,15 +26,12 @@ import dsh_env as _env_mod          # 探测层单例（与 launcher/plugins 共
 
 FLAGS = getattr(subprocess, "CREATE_NO_WINDOW", 0)
 
-# cmd.exe 对 stdin 脚本【引号内】仍做 %VAR% 展开（本机实测），且 & | < > ^ ! "
-# 与控制符任何一个都会改变脚本语义。路径里含这些字符的条目一律跳过，
-# 宁可少补一个链接，也不把拼出来的额外命令喂给 cmd。
-_CMD_UNSAFE = re.compile(r"[%&|<>^!\"\r\n\t]")
-
-
+# cmd.exe 安全闸统一收口到探测层（含全部 C0/DEL 控制符，覆盖 stdin 脚本
+# 的 %VAR% 展开、& 拼接、0x1A 终止读取等全部形态）。此处只是转调别名，
+# 让旧调用点与既有用例不用改。
 def cmd_arg_safe(p):
     """路径能否安全拼进 cmd.exe 脚本行（mklink / rmdir 的 stdin 脚本）。"""
-    return _CMD_UNSAFE.search(p) is None
+    return _env_mod.cmd_arg_safe(p)
 
 # 终端是 chcp 936（GBK）时，打印非 GBK 字符会抛 UnicodeEncodeError。
 # 这里统一降级为 replace，保证任何情况下都不会因此崩溃。
@@ -96,8 +93,9 @@ def kill_node():
     """
     killed = []
 
-    # 探测层单例：严格判据 + netstat 快照（不再逐端口 connect 等超时）
-    ports = sorted({r["port"] for r in _env_mod.netstat_table()
+    # 探测层单例：严格判据 + 【强制刷新】的 netstat 快照 ——
+    # 击杀绝不吃 ≤3 秒的陈旧表（PID 可能已被系统复用）
+    ports = sorted({r["port"] for r in _env_mod.netstat_table(refresh=True)
                     if _env_mod.is_dsh_here(r["port"])})
     try:
         for port in ports:
@@ -133,7 +131,7 @@ def heal_profile(profile_dir):
         return 0, len(missing)
     # 先把该建的都算出来，再【一次性】跑一个 .bat。
     # 原先是每个链接起一次 cmd.exe（实测每次 0.6 秒），65 个就要 39 秒。
-    todo = []
+    todo, todo_u = [], []
     for name in missing:
         target = os.path.join(src, *name.split("/"))
         link = os.path.join(fb, *name.split("/"))
@@ -142,6 +140,13 @@ def heal_profile(profile_dir):
         if not (cmd_arg_safe(link) and cmd_arg_safe(target)):
             log("    [跳过] 路径含 cmd 元字符，拒绝进 mklink 脚本：%s" % name)
             continue
+        try:
+            (link + target).encode("gbk")
+        except UnicodeEncodeError:
+            # [!] stdin 脚本按 GBK 编码，非 GBK 名会被折叠成「?」→ mklink
+            #     必失败。这些条目直接走 Unicode 参数列表逐条建，保住正确性
+            todo_u.append((link, target))
+            continue
         os.makedirs(os.path.dirname(link), exist_ok=True)
         # [!] 用 lexists：断链（目标丢失的 junction）在 exists 眼里是"不存在"，
         #     于是 mklink 会因"已存在"失败，这个链接就永远补不上。
@@ -149,9 +154,12 @@ def heal_profile(profile_dir):
             if os.path.isdir(link):
                 continue          # 正常链接，跳过
             # 断链 → 先清掉再重建
-            subprocess.run(["cmd.exe", "/c", "rmdir", "/S", "/Q", link],
-                           capture_output=True, creationflags=FLAGS,
-                           timeout=120)
+            try:
+                subprocess.run(["cmd.exe", "/c", "rmdir", "/S", "/Q", link],
+                               capture_output=True, creationflags=FLAGS,
+                               timeout=120)
+            except Exception:
+                pass          # 清理失败不炸整个自愈流程（下方放弃该条）
             if os.path.lexists(link):
                 continue          # 清不掉就放弃这个，不硬来
         todo.append((link, target))
@@ -167,6 +175,7 @@ def heal_profile(profile_dir):
                          for link, target in todo)
         script += "exit\r\n"
         done = False
+        proc = None
         try:
             proc = subprocess.Popen(["cmd.exe"], stdin=subprocess.PIPE,
                                     stdout=subprocess.PIPE,
@@ -174,6 +183,17 @@ def heal_profile(profile_dir):
                                     creationflags=FLAGS)
             proc.communicate(script.encode("gbk", "replace"), timeout=600)
             done = True
+        except subprocess.TimeoutExpired:
+            # [!] communicate 超时【不会】杀子进程 —— 不杀的话已喂入的
+            #     mklink 脚本会继续跑，launcher 报「已放弃」后 junction
+            #     还在陆续出现，用户此刻启动 dsh 就撞上自愈竞态窗口
+            try:
+                if proc:
+                    proc.kill()
+                    proc.communicate(timeout=30)
+            except Exception:
+                pass
+            done = False
         except Exception:
             done = False
 
@@ -188,7 +208,18 @@ def heal_profile(profile_dir):
                 except Exception:
                     pass
 
-    created = sum(1 for link, _ in todo if os.path.isdir(link))
+    if todo_u and not DRY:
+        # 非 GBK 名的条目：Unicode 参数列表逐条建（不经 stdin 脚本，
+        # 没有编码折叠问题；cmd_arg_safe 已过闸，无元字符风险）
+        for link, target in todo_u:
+            try:
+                subprocess.run(["cmd.exe", "/c", "mklink", "/J", link, target],
+                               capture_output=True, creationflags=FLAGS,
+                               timeout=120)
+            except Exception:
+                pass
+
+    created = sum(1 for link, _ in todo + todo_u if os.path.isdir(link))
     return created, len(missing)
 
 
@@ -219,11 +250,25 @@ def clean_pnpm_leftovers(profile_dir, max_depth=2):
                 continue
             if pat.match(e.name):
                 found.append(e.path)
-                if not DRY and CLEAN:
+                # [!] 只删「长得像 pnpm 残留」的：目录里有 package.json，
+                #     或本身是 reparse point（junction/symlink）。空目录只列
+                #     不删 —— 名字撞车（如 foo_tmp_12_ab）的合法包不能误伤
+                looks_like_pkg = os.path.exists(os.path.join(e.path, "package.json"))
+                try:
+                    is_reparse = os.path.realpath(e.path) != os.path.abspath(e.path)
+                except OSError:
+                    is_reparse = False
+                if not looks_like_pkg and not is_reparse:
+                    log("    [跳过] 无 package.json 也不是链接，不像 pnpm 残留，只列不删：%s"
+                        % e.name)
+                elif not DRY and CLEAN:
                     if cmd_arg_safe(e.path):
-                        subprocess.run(["cmd.exe", "/c", "rmdir", "/S", "/Q", e.path],
-                                       capture_output=True, creationflags=FLAGS,
-                                       timeout=120)
+                        try:
+                            subprocess.run(["cmd.exe", "/c", "rmdir", "/S", "/Q", e.path],
+                                           capture_output=True, creationflags=FLAGS,
+                                           timeout=120)
+                        except Exception:
+                            pass      # 超时/失败不炸整个自愈流程
                     else:
                         log("    [跳过] 残留目录路径含 cmd 元字符，拒绝删除：%s"
                             % e.path)

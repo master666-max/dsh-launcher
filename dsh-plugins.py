@@ -68,6 +68,12 @@ def read_json(p):
         return None
 
 
+def clean_disp(s):
+    """终端输出净化：剥离 C0/DEL 控制符 —— dump 数据里的 ESC 序列
+    不能被允许操纵插件管理界面（清屏/伪装确认提示等）。"""
+    return re.sub(r"[\x00-\x1f\x7f]", "?", s) if isinstance(s, str) else s
+
+
 # ==================== 降级：YAML 解析 ====================
 ID_RE = re.compile(r"^(\s*)-\s*id:\s*([A-Za-z0-9@/_.\-]+)\s*$")
 
@@ -357,10 +363,14 @@ def check_conflicts(st):
 
 # ==================== 写回 ====================
 def backup_patch(patch, keep=10):
-    """备份补丁文件；只保留最近 keep 份，避免无限堆积。"""
+    """备份补丁文件；只保留最近 keep 份，避免无限堆积。
+
+    备份名带毫秒 —— 同一秒内连续两次切换不再互相覆盖（旧版按秒命名）。
+    """
     if not patch or not os.path.exists(patch):
         return None
-    dst = patch + ".bak-plugins-" + time.strftime("%Y%m%d-%H%M%S")
+    dst = "%s.bak-plugins-%s-%d" % (patch, time.strftime("%Y%m%d-%H%M%S"),
+                                    int(time.time() * 1000) % 1000000)
     try:
         shutil.copy2(patch, dst)
     except Exception:
@@ -379,6 +389,12 @@ def set_disabled(patch, eid, flag):
         return False, "没有可写的补丁文件"
     if not os.path.exists(patch):
         return False, "补丁文件不存在：%s" % patch
+    # [!] eid 会被原样写进 YAML —— 它是 dump 输出里的外部数据。带 YAML
+    #     指示符（`|` 会吞掉下一行）、空白或控制符的 id 写进去会让补丁
+    #     解析崩掉或静默失效；只放行安全字符集，其余拒绝并说明
+    if not re.match(r"^[A-Za-z0-9@/_.\-]+$", eid or ""):
+        return False, ("入口 id 含不安全字符（YAML 指示符/空白/控制符），"
+                       "已拒绝写入：%r" % eid)
 
     # [!] 关键防护：read_text 读失败时返回 ""，若照此写回会【清空用户全部补丁】。
     #     必须先确认真的读到了内容，否则中止。
@@ -543,8 +559,8 @@ def render(st, rows, conflicts, page, per_page):
     for i in range(lo, hi_):
         r = rows[i]
         o.append("  %-4d %-6s %-32s %s"
-                 % (i + 1, r["state"], r["id"][:32],
-                    (r.get("impl") or r["pkg"])[:30]))
+                 % (i + 1, r["state"], clean_disp(r["id"])[:32],
+                    clean_disp(r.get("impl") or r["pkg"])[:30]))
     o += [LINE,
           "  第 %d/%d 页   共 %d 个入口（启用 %d / 禁用 %d / 条件 %d）"
           % (page + 1, pages, total,
@@ -616,7 +632,8 @@ def main():
     if list_only:
         for i, r in enumerate(rows, 1):
             log("%-4d %-6s %-32s %s"
-                % (i, r["state"], r["id"], r.get("impl") or r["pkg"]))
+                % (i, r["state"], clean_disp(r["id"]),
+                   clean_disp(r.get("impl") or r["pkg"])))
         return 0
 
     page = 0
@@ -644,11 +661,16 @@ def main():
             page -= 1
             continue
         if low == "r":
-            # 显式刷新：强制重跑探测（会花几十秒，但能拿到权威树）
-            print("\n  重新探测中（约 30 秒）...")
-            st = collect(force=True)
-            rows = st["rows"]
-            conflicts, miss = check_conflicts(st)
+            # 显式刷新：强制重跑探测（--help 最坏 90s + dump 最坏 240s）
+            # [!] 必须有护栏 —— 旧版 collect 抛异常会整个插件界面闪退
+            print("\n  重新探测中（强制重探，最坏约 5 分钟，请耐心等）...")
+            try:
+                st = collect(force=True)
+                rows = st["rows"]
+                conflicts, miss = check_conflicts(st)
+            except Exception as e:
+                print("  [X] 刷新失败（保留原有数据）：%s" % e)
+                time.sleep(1.6)
             continue
         if low == "e":
             print()
@@ -686,7 +708,9 @@ def main():
             pause_in()
             continue
 
-        if not cmd.isdigit():
+        if not cmd.isdecimal():
+            # [!] 不能用 isdigit —— '²'.isdigit() 为 True 而 int('²') 抛
+            #     ValueError，插件界面会被一个上标数字打崩（实测）
             print("  无效输入")
             time.sleep(1)
             continue

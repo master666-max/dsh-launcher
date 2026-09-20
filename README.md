@@ -32,7 +32,7 @@
 | `dsh-launcher.py` | 编排 + 交互菜单。**不含任何 dsh 内部知识** |
 | `dsh-plugins.py` | 插件管理：列出全部入口、冲突检查、启用/禁用（写 profile 补丁） |
 | `dsh-fallback-heal.py` | 补齐 `.dsh-module-fallback` 缺失 junction |
-| `dsh_tests.py` | **回归测试（23 用例）**，写操作全在临时副本上 |
+| `dsh_tests.py` | **回归测试（29 用例）**，写操作全在临时副本上 |
 | `dsh-selfcheck.py` | 静态自检：语法 / 缺失 import / 未定义名 / GBK 字符 / subprocess 参数名 / bat 行尾 / 解耦 |
 | `dsh-env.py` | 命令行薄壳（`--dump` / `--refresh` / `--json`） |
 | `MAINTENANCE.md` | **维护与审计说明**（故障速查、审计要点、改动纪律） |
@@ -41,7 +41,7 @@
 
 ```bat
 python dsh-selfcheck.py      :: 静态自检，0 问题才算完
-python dsh_tests.py          :: 23 用例回归，全过才算完
+python dsh_tests.py          :: 29 用例回归，全过才算完
 python dsh-env.py --refresh  :: dsh 升级或换目录后强制重探
 ```
 

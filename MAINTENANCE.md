@@ -24,7 +24,7 @@
 | `dsh-launcher.py` | 编排 + 交互菜单：启动 dsh、调自愈、调插件工具。**只做编排，不含 dsh 内部知识** | import dsh_env |
 | `dsh-plugins.py` | 插件管理：列出 181 个入口、冲突检查、启用/禁用（写 profile 补丁） | import dsh_env |
 | `dsh-fallback-heal.py` | 补齐 `.dsh-module-fallback` 缺失 junction（可子进程或直跑） | import dsh_env |
-| `dsh_tests.py` | **回归测试 23 用例**（改完代码必跑） | import dsh_env、加载 dsh-launcher/plugins |
+| `dsh_tests.py` | **回归测试 29 用例**（改完代码必跑） | import dsh_env、加载 dsh-launcher/plugins |
 | `dsh-selfcheck.py` | 静态自检：语法/缺失 import/未定义名/GBK 字符/subprocess 参数名/bat 行尾 | 无依赖 |
 | `dsh-env.py` | 命令行薄壳（`--dump` / `--refresh` / `--json`），实现都在 dsh_env.py | import dsh_env |
 
@@ -47,7 +47,7 @@
 ### 改完代码后必做的三件事
 ```
 python dsh-selfcheck.py     # 静态自检（0 问题才算完）
-python dsh_tests.py         # 23 用例回归（全过才算完）
+python dsh_tests.py         # 29 用例回归（全过才算完）
 python dsh-env.py --refresh # 强制重探（dsh 升级/换目录后）
 ```
 
@@ -89,12 +89,19 @@ python _mutate_all.py       # 故意改坏 10 处关键逻辑，看用例抓不�
 
 ### 1. task-board 脏锁（最阴）
 `~/.dsh/task-board/ledger-v2.lock` —— `@linxin666/dsh-client-ui-task-board` 的锁。
-**强杀 dsh 会留下三种形态的锁**，任何一种都会让 dsh 下次启动直接崩
-（`plugin tree failed to load ... lock is unreadable`）：
-① 0 字节　② 内容非合法 JSON　③ **格式合法但记录的 pid 已死**（最常被漏掉）。
+**强杀 dsh 会留下四种形态的锁**，任何一种都会让 dsh 下次启动直接崩
+（`plugin tree failed to load ... ui-task-board`，退出码 1）：
+① 0 字节　② 内容非合法 JSON　③ **格式合法但记录的 pid 已死**（最常被漏掉）
+④ **格式合法、pid 也活着，但那个 pid 已被 Windows 复用给别的程序**
+（2026-09-20 实测：强杀留下的 31848 → 被复用成 `Nahimic3.exe`）。
 
-处置：启动器已在启动前自动清理（`clean_stale_locks`），三重把关缺一不可：
-候选端口无 dsh → **任意 node 端口也无 dsh** → `lock_is_stale` 判脏 → 备份后删。
+> ④ 尤其阴：`pid_alive()` 返回 True，看起来「有 dsh 在跑」，实际**根本没有 dsh**。
+> 判据必须再确认锁主是 **node.exe**（dsh 一定是 node 跑的）→ 详见第七章 2026-09-20 条目。
+
+处置：启动器已在启动前自动清理（`clean_stale_locks`），把关缺一不可：
+候选端口无 dsh → **任意 node 端口也无 dsh** → netstat 本身必须成功 →
+**锁 mtime 距今 ≥5 秒**（正在写的活锁瞬间就是 0 字节）→ `lock_is_stale` 判脏 →
+**token 脱敏备份**后删。备份按【每把锁】保留最近 5 份（补丁备份是 10 份，有意区分）。
 **审计时若发现有人放宽这些前提，立刻回滚。**
 
 ### 2. 清理残留实例只认端口+签名
@@ -165,6 +172,7 @@ dsh 每次只建它需要的 220/285 个链接，多补的会被它删掉，
 | 找不到 pnpm / 不是内部命令 | PATH 被裁剪 | bat 已做 PATH 钉扎；确认 `%APPDATA%\npm` 在 PATH |
 | 插件状态显示旧数据 | dump 缓存 | 菜单 [5] 或 `python dsh-env.py --refresh` |
 | **双击黑框闪一下就退** | **① .bat 行尾不是纯 CRLF　② 括号块内 `if` 与命令跨行（见四·8）** | **跑 `python _accept_all.py`，它会同时查行尾、查跨行 if、并跑语法闸** |
+| **启动时 `plugin tree failed to load: ... ui-task-board`（退出码 1）** | **脏锁 + PID 被系统复用**：锁里记的 pid 已死、但被 Windows 复用给了别的程序（实测 31848 → `Nahimic3.exe`）。旧判据只看「pid 还活着吗」→ 误判成正常锁 → 不敢清 → 新 dsh 抢 task-board 锁失败 | 已修（2026-09-20，见第七章）：判据补「pid 活着但**不是 node.exe** = 已被复用 = 脏锁」。手动兜底：确认无 dsh 在跑后删 `~/.dsh/task-board/ledger-v2.lock` |
 
 ### 排「启动器秒退」的正确顺序（2026-09-18 实战总结）
 
@@ -191,6 +199,72 @@ dsh 每次只建它需要的 220/285 个链接，多补的会被它删掉，
 **判「整份文件」是否合法，必须用「全行 + 收尾片段」。**
 
 ## 七、变更记录
+
+### 2026-09-20　修复脏锁误判：PID 被系统复用 → 不清锁 → dsh 抢锁崩
+
+**症状**：双击启动器，第 1 次尝试起来后立刻崩：
+
+```
+Error: dsh: plugin tree failed to load: failed to apply loader entry
+  ui-task-board (@linxin666/dsh-client-ui-task-board):
+  task-board ledger is already owned by process 31848; if this PID was
+  reused after a crash and no other DSH host is running, remove
+  C:\Users\<你>\.dsh\task-board\ledger-v2.lock manually and retry
+```
+
+启动器自己那句「正在检查强杀残留锁」跑过了，**却没清**。最后靠第 4 个候选
+（`node --import tsx/esm apps\cli\src\bin.ts web`）才起来。
+
+**根因（实测钉死）**：
+```
+锁文件内容  : {"pid":31848,"token":"...","startedAt":...,"probe":"exact"}
+那个 pid 现在: Nahimic3.exe          ← 被 Windows 复用给了音频驱动
+```
+`lock_is_stale` 旧逻辑只有三种判脏情形：① 0 字节　② 非合法 JSON　③ **pid 已不存在**。
+31848 这个 pid **还活着**（只是换了主人）→ 三种都不命中 → 返回「看起来是正常锁」
+→ 启动器不敢清 → 新 dsh 抢锁失败 → 整个插件树加载失败 → 退出码 1。
+
+> dsh 报错文案自己就写了 "if this PID was reused after a crash" ——
+> **上游早就知道这个坑，是我们的判据漏了它。**
+
+**修复**：`lock_is_stale(fp, names=None)` 增加第四种判脏情形
+
+```python
+if alive is True:
+    actual = names.get(str(pid))          # names 可传入，批量扫描时复用一次 tasklist
+    if actual is not None and actual.lower() != "node.exe":
+        return True, "记录的 pid %s 已被系统复用为 %s（非 node）" % (pid, actual)
+```
+
+**判据从严的三条理由**（都写进了代码注释）：
+1. dsh 一定是 **node.exe** 跑的，所以「锁主不是 node」= 这把锁属于已死的 dsh；
+2. **只在明确查到映像名时才判脏** —— `names.get(pid)` 返回 `None`（tasklist 失败、
+   进程刚好退出）时一律保守放过。宁可漏判一轮，**绝不给「把活 dsh 的锁当脏锁
+   删掉」留机会**；
+3. `clean_stale_locks` 原有四道保护（netstat 必须成功 → 任意端口无 dsh 在跑 →
+   文件位置/后缀 → mtime ≥5 秒）**全部保留**，本次只加严、不放松。
+
+`clean_stale_locks` 里改为**惰性取一次映像名**（`_names()` 闭包缓存）：
+只有真遇到「pid 还活着」的锁才跑 tasklist，没有这种锁时零开销。
+
+**测试（用例 29 → 31）**：
+- `lock_is_stale` 用例扩充为 7 种情形，并**改成显式传 `names`** ——
+  旧用例拿 `os.getpid()`（python.exe）当「活 dsh」，是**不真实的样本**：
+  真实活锁必须由 node.exe 持有。现在三种情况都覆盖：
+  `{me:"node.exe"}` → 不脏｜`{me:"nahimic3.exe"}` → 脏｜`{}`（查不到）→ 保守不脏
+- 新增端到端用例 `t_clean_lock_pid_reuse`：temp 里伪造整套环境
+  （`DSH_STATE` 指向 temp、netstat 成功、无 dsh 在跑、映像名是 nahimic3.exe），
+  验证**锁真被清掉 + 备份存在 + 备份里 token 已脱敏**
+- 新增反向守护 `t_clean_lock_live_node_guard`：映像名是 `node.exe` 时
+  **锁必须原样留着**（防误删活锁）
+
+**变异测试 11 → 12 条，抓到 12 / 漏掉 0 / 跳过 0。**
+> 顺带修掉两个**静默失效的变异体锚点**（之前一直显示「跳过」= 那两条修复
+> 其实处于无守护状态）：`split_win_cmdline` 的实现从无 `has_q` 版演进到有 `has_q` 版，
+> 旧锚点不再匹配；`cmd_arg_safe` 已从 `dsh-fallback-heal.py` 下沉到 `dsh_env.py`
+> （heal 里只剩转调别名），旧锚点指向了已经不存在的实现。
+> **教训：变异体「跳过」比「漏掉」更危险 —— 漏掉会报 ✗，跳过是静默的，
+> 看起来一切正常。锚点应取函数体里最短、最稳定的一行。**
 
 ### 2026-09-18　修复「双击启动器秒退」+ 加装常驻回归器
 
@@ -240,10 +314,24 @@ dsh 每次只建它需要的 220/285 个链接，多补的会被它删掉，
 约 38 秒后 3080 与 3443 由**同一 PID** 监听、HTTP 401 + `dsh web` 确认身份 →
 **双击启动器已能真正拉起 dsh。**
 
-### 2026-09-18（更早）　复审外部 agent 的 14 项改动 + 补 6 项裸奔守护
-
-
-## 七、变更记录（按时间倒序）
+- **2026-09-19**：安全审查（复刻 claude-security 管线：3 研究员分镜 + 3 镜头验证组，
+  报告见 `SECURITY-REVIEW-20260919.md`，28 项发现），按 `FIX-TICKET-20260919.md`
+  全量修复（P0 遗留 + T1–T20）：
+  - **稳定性**：启动器跨实例互斥（F11，连带消掉清锁 TOCTOU 的主要触发面）；
+    清锁加 5 秒新鲜度窗 + 每删 10 个复核 dsh（F2）；`kill_leftover` 击杀护栏（F1）；
+    探测首中即返 + 回环 HTTP 超时 1s + 长操作进度提示（F10）；
+    菜单内 Ctrl+C 一律回菜单；插件刷新与菜单[5]加护栏（F5）；`isdecimal` 修上标数字闪退（F19）。
+  - **安全**：锁备份 token 脱敏（F4）；eid 写入字符集闸（F8）；profile 名与
+    预编译路径的 cmd 元字符闸（F15）；start_command 首段为真实文件直接启动、
+    其余 `/s` 整体外引号字符串命令行（F7）；dump 缓存 tmp+replace 原子写 + meta 长度校验（F12）；
+    击杀前强制刷新 netstat（T10）；heal 超时杀孙进程 + rmdir 护栏（T17）；
+    非 GBK 名走 Unicode 参数回退（T13）；`_e2e_accept` 击杀闸 + 必删计划任务 + 日志自脱敏（F3/F22/F4）。
+  - **解析器**：split_win_cmdline 补空参数/NBSP/中缀引号（T11）；dump id 捕获整段 +
+    `#===` 分节（T14）；dump 输出 UTF-8 优先解码（T14）；selfcheck 的 bat 检查器
+    修四种漏检（T8）+ tokenize 剥注释 + `_*.py` 入扫描面（T15，
+    `_accept_all.py` 的 .workbuddy 硬编码解释器随之清除）。
+  - 遗留计划任务 `dsh-e2e-accept` 与日志/备份中的 token 已人工清除（dsh 本体未动）。
+  - 回归 23 → 29 用例全绿，selfcheck 0 问题，端到端 `--check` 通过（181 入口，3.4s）。
 
 
 - **2026-09-17**：建立（launch 经历三轮提速 105s→43s→15s）；修 13+ 轮 bug。
@@ -360,7 +448,7 @@ python _accept_all.py        :: 一键跑齐：静态自检 + 23 回归用例 + 
 单独跑也可以：
 ```bat
 python dsh-selfcheck.py      :: 含解耦检查 + bat 行尾 + 块内跨行 if 检查
-python dsh_tests.py          :: 23 用例
+python dsh_tests.py          :: 29 用例
 ```
 
 ### 排「启动器秒退」的最小步骤
