@@ -32,18 +32,27 @@
 | `dsh-launcher.py` | 编排 + 交互菜单。**不含任何 dsh 内部知识** |
 | `dsh-plugins.py` | 插件管理：列出全部入口、冲突检查、启用/禁用（写 profile 补丁） |
 | `dsh-fallback-heal.py` | 补齐 `.dsh-module-fallback` 缺失 junction |
-| `dsh_tests.py` | **回归测试（29 用例）**，写操作全在临时副本上 |
+| `dsh_tests.py` | **回归测试（31 用例）**，写操作全在临时副本上 |
 | `dsh-selfcheck.py` | 静态自检：语法 / 缺失 import / 未定义名 / GBK 字符 / subprocess 参数名 / bat 行尾 / 解耦 |
+| `dsh-accept.py` | **一键验收**：静态自检 + 31 回归用例 + bat 语法闸 + 解释器探测 + 行尾检查 |
+| `dsh-mutate.py` | **变异测试**：故意改坏 12 处关键逻辑，验证回归用例真能抓到 |
 | `dsh-env.py` | 命令行薄壳（`--dump` / `--refresh` / `--json`） |
 | `MAINTENANCE.md` | **维护与审计说明**（故障速查、审计要点、改动纪律） |
 
 ## 改完代码后必做
 
 ```bat
+python dsh-accept.py         :: 【推荐】一键跑齐下面三段 + 解释器探测 + 行尾检查
+```
+分步跑也可以：
+```bat
 python dsh-selfcheck.py      :: 静态自检，0 问题才算完
-python dsh_tests.py          :: 29 用例回归，全过才算完
+python dsh_tests.py          :: 31 用例回归，全过才算完
 python dsh-env.py --refresh  :: dsh 升级或换目录后强制重探
 ```
+
+改逻辑**之前**建议先跑 `python dsh-mutate.py`（变异测试）——
+它验证"用例是否真的能抓到回归"，这是"全绿"之外的独立一层保证。
 
 ## 环境要求
 

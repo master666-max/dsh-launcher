@@ -24,8 +24,10 @@
 | `dsh-launcher.py` | 编排 + 交互菜单：启动 dsh、调自愈、调插件工具。**只做编排，不含 dsh 内部知识** | import dsh_env |
 | `dsh-plugins.py` | 插件管理：列出 181 个入口、冲突检查、启用/禁用（写 profile 补丁） | import dsh_env |
 | `dsh-fallback-heal.py` | 补齐 `.dsh-module-fallback` 缺失 junction（可子进程或直跑） | import dsh_env |
-| `dsh_tests.py` | **回归测试 29 用例**（改完代码必跑） | import dsh_env、加载 dsh-launcher/plugins |
-| `dsh-selfcheck.py` | 静态自检：语法/缺失 import/未定义名/GBK 字符/subprocess 参数名/bat 行尾 | 无依赖 |
+| `dsh_tests.py` | **回归测试 31 用例**（改完代码必跑） | import dsh_env、加载 dsh-launcher/plugins |
+| `dsh-selfcheck.py` | 静态自检：语法/缺失 import/未定义名/GBK 字符/subprocess 参数名/bat 行尾/解耦 | 无依赖 |
+| `dsh-accept.py` | **一键验收**：静态自检 + 31 回归用例 + bat 语法闸 + 解释器探测 + 行尾，一次跑齐 | 子进程调上面两个 |
+| `dsh-mutate.py` | **变异测试**：故意改坏 12 处关键逻辑，验证用例真能抓到回归 | 在 tempfile 副本上跑 dsh_tests.py |
 | `dsh-env.py` | 命令行薄壳（`--dump` / `--refresh` / `--json`），实现都在 dsh_env.py | import dsh_env |
 
 数据/缓存（可随时删除，会自动重建）：
@@ -46,20 +48,31 @@
 
 ### 改完代码后必做的三件事
 ```
+python dsh-accept.py        # 【推荐】一键跑齐下面三段 + 解释器探测 + 行尾检查
+```
+或者分步：
+```
 python dsh-selfcheck.py     # 静态自检（0 问题才算完）
-python dsh_tests.py         # 29 用例回归（全过才算完）
+python dsh_tests.py         # 31 用例回归（全过才算完）
 python dsh-env.py --refresh # 强制重探（dsh 升级/换目录后）
 ```
 
 ### 动手改逻辑前：先跑变异测试
 ```
-python _mutate_all.py       # 故意改坏 10 处关键逻辑，看用例抓不抓得到
+python dsh-mutate.py       # 故意改坏 12 处关键逻辑，看用例抓不抓得到
 ```
 **理由**：用例"全绿"不等于有用例。本项目实测过 —— `parse_dump` / `is_dsh_here` /
 `set_disabled` / `split_win_cmdline` / `clean_stale_locks` / `live_now` 六处关键修复
 **全部处于"裸奔"状态**（改回旧写法，回归照样全绿）。跑一遍变异测试就暴露了。
-**任何新增/修改的关键逻辑，都应在 `_mutate_all.py` 里加一条变异体**：
-改坏它 → 跑用例 → 必须抓到（输出 `抓到 ✓`）。抓不到的用例等于没有。
+**任何新增/修改的关键逻辑，都应在 `dsh-mutate.py` 里加一条变异体**：
+改坏它 → 跑用例 → 必须抓到（输出 `[抓到]`）。抓不到的用例等于没有。
+
+> ⚠️ **看到 `[跳过]` 必须去修锚点，不能当正常**（2026-09-20 血证）：
+> 变异体锚点会因**正常重构**而失效（实测 `split_win_cmdline` 实现演进、
+> `cmd_arg_safe` 下沉到 `dsh_env.py`），失效后**静默跳过** ——
+> 那两条修复等于完全没有守护，而输出看起来一切正常。
+> **「跳过」比「漏掉」更危险**：漏掉会报错让人看见，跳过是静默的。
+> 锚点请取函数体里**最短、最稳定的一行**。
 
 > 变异测试的常见翻车点（都踩过）：
 > - **断言含注释/docstring 里的字**：`"dsh web" in inspect.getsource(f)` 会命中注释，
@@ -171,7 +184,7 @@ dsh 每次只建它需要的 220/285 个链接，多补的会被它删掉，
 | `EPERM: symlink` | fallback 竞态 | 菜单 [4] 手动补齐 |
 | 找不到 pnpm / 不是内部命令 | PATH 被裁剪 | bat 已做 PATH 钉扎；确认 `%APPDATA%\npm` 在 PATH |
 | 插件状态显示旧数据 | dump 缓存 | 菜单 [5] 或 `python dsh-env.py --refresh` |
-| **双击黑框闪一下就退** | **① .bat 行尾不是纯 CRLF　② 括号块内 `if` 与命令跨行（见四·8）** | **跑 `python _accept_all.py`，它会同时查行尾、查跨行 if、并跑语法闸** |
+| **双击黑框闪一下就退** | **① .bat 行尾不是纯 CRLF　② 括号块内 `if` 与命令跨行（见四·8）** | **跑 `python dsh-accept.py`，它会同时查行尾、查跨行 if、并跑语法闸** |
 | **启动时 `plugin tree failed to load: ... ui-task-board`（退出码 1）** | **脏锁 + PID 被系统复用**：锁里记的 pid 已死、但被 Windows 复用给了别的程序（实测 31848 → `Nahimic3.exe`）。旧判据只看「pid 还活着吗」→ 误判成正常锁 → 不敢清 → 新 dsh 抢 task-board 锁失败 | 已修（2026-09-20，见第七章）：判据补「pid 活着但**不是 node.exe** = 已被复用 = 脏锁」。手动兜底：确认无 dsh 在跑后删 `~/.dsh/task-board/ledger-v2.lock` |
 
 ### 排「启动器秒退」的正确顺序（2026-09-18 实战总结）
@@ -307,7 +320,7 @@ if alive is True:
 > 是被当成**命令**的，只是同样没带语句体 → 剥离条件必须**循环剥到底**，
 > 只剥一层会得到 `if exist "..."` 这个「非空」结果从而漏报。
 
-**新增一键验收**：`python _accept_all.py`，一次跑完
+**新增一键验收**：`python dsh-accept.py`，一次跑完
 ① 静态自检 ② 23 个回归用例 ③ bat 语法闸 ④ 解释器探测 ⑤ 行尾检查。
 
 **端到端结论**：用计划任务（绕开沙箱的 `spawn EPERM` 假故障）跑桌面那个 bat，
@@ -329,7 +342,7 @@ if alive is True:
   - **解析器**：split_win_cmdline 补空参数/NBSP/中缀引号（T11）；dump id 捕获整段 +
     `#===` 分节（T14）；dump 输出 UTF-8 优先解码（T14）；selfcheck 的 bat 检查器
     修四种漏检（T8）+ tokenize 剥注释 + `_*.py` 入扫描面（T15，
-    `_accept_all.py` 的 .workbuddy 硬编码解释器随之清除）。
+    `dsh-accept.py` 的 .workbuddy 硬编码解释器随之清除）。
   - 遗留计划任务 `dsh-e2e-accept` 与日志/备份中的 token 已人工清除（dsh 本体未动）。
   - 回归 23 → 29 用例全绿，selfcheck 0 问题，端到端 `--check` 通过（181 入口，3.4s）。
 
@@ -382,7 +395,7 @@ if alive is True:
        是排在 config **之后**的（如 `tool-web`）。
        已补 4 个用例（含 `disabled` 后置样本、判据精确串断言、
        config 子块不可被改断言、命令行切分 5 组对照）。
-  - 回归用例 **17 → 23**；新增**变异测试**手段（`_mutate_all.py`）：
+  - 回归用例 **17 → 23**；新增**变异测试**手段（`dsh-mutate.py`）：
     故意改坏 10 处关键逻辑，确认用例能抓到 —— 抓不到的用例等于没有。
     第一轮 **7/10**，补齐守护用例后第二轮 **10/10 全部抓到**。
   - **端到端验收**（计划任务绕开沙箱）：启动器 `--start --yes` 全链路通过 ——
@@ -442,18 +455,18 @@ set HTTPS_PROXY=
 
 ### 提交前自检
 ```bat
-python _accept_all.py        :: 一键跑齐：静态自检 + 23 回归用例 + bat 语法闸 + 行尾
+python dsh-accept.py        :: 一键跑齐：静态自检 + 31 回归用例 + bat 语法闸 + 行尾
 ```
 
 单独跑也可以：
 ```bat
 python dsh-selfcheck.py      :: 含解耦检查 + bat 行尾 + 块内跨行 if 检查
-python dsh_tests.py          :: 29 用例
+python dsh_tests.py          :: 31 用例
 ```
 
 ### 排「启动器秒退」的最小步骤
 ```bat
-python _accept_all.py        :: 第 3 段就是 bat 语法闸，秒退问题第一站
+python dsh-accept.py        :: 第 3 段就是 bat 语法闸，秒退问题第一站
 ```
 若要看旧/新对照，`_probe2.py` 会把「跑得动 vs 跑不动」两份 bat 各测两次并打表。
 

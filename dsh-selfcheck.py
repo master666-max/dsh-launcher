@@ -25,8 +25,13 @@ except Exception:
 TOOLS = os.path.dirname(os.path.abspath(__file__))
 DESK = os.path.join(os.path.expanduser("~"), "Desktop")
 # 注意：dsh-selfcheck.py 自己不列入（它内含解耦检测的模式串，会自报）
+# dsh-accept.py / dsh-mutate.py 是【常驻运维工具】（文档让人直接跑它们），
+# 不是"随写随删的临时脚本" —— 因此列入全量检查并入库。
+# 2026-09-20 之前它们叫 _accept_all.py / _mutate_all.py，因 _* 前缀被
+# .gitignore 挡住 → MAINTENANCE.md 让人跑却不在仓库里（文档与仓库不自洽）。
 PY_FILES = ["dsh_env.py", "dsh-launcher.py", "dsh-plugins.py",
-            "dsh-fallback-heal.py", "dsh_tests.py", "dsh-env.py"]
+            "dsh-fallback-heal.py", "dsh_tests.py", "dsh-env.py",
+            "dsh-accept.py", "dsh-mutate.py"]
 # [!] 目录里的 _*.py 临时脚本也在扫描面内 —— 它们会被真实运行，
 #     解耦红线对其同样生效（曾漏掉 _accept_all.py 里的 .workbuddy 硬编码）。
 #     语法/未定义名等 AST 检查仍只跑 PY_FILES（临时脚本随写随删，不追求全检）。
