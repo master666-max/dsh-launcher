@@ -1,0 +1,26 @@
+# ============================================================
+#  行尾策略（发布源必须钉死）
+# ============================================================
+#
+# [!] 为什么必须显式写这个文件：
+#     本项目实测过一次「双击启动器秒退」——窗口在打印任何东西之前就消失。
+#     其中一个成因就是 .bat 行尾不是纯 CRLF。
+#     而 git 的 core.autocrlf 是【本机设置】：
+#       - clone 方是 Windows（autocrlf=true）→ checkout 出 CRLF，没事
+#       - clone 方是 Linux/macOS（autocrlf=false）→ checkout 出 LF → bat 直接坏
+#     所以不能依赖 clone 方的设置，必须在仓库里用 eol=crlf 钉死。
+
+# Windows 批处理：必须纯 CRLF（裸 LF 必现秒退）
+*.bat text eol=crlf
+*.cmd text eol=crlf
+
+# Python：统一 LF（跨平台一致；Python 两种行尾都能跑，但统一更好）
+*.py text eol=lf
+
+# 文档：统一 LF
+*.md text eol=lf
+
+# 运行时缓存：按二进制处理，不做任何行尾转换
+# （这些文件本来就被 .gitignore 排除，这里是双保险）
+*.cache.json -text
+*.cache.txt  -text

@@ -9,9 +9,25 @@
 
 ## 快速开始
 
-1. 把本目录放到 `%USERPROFILE%\dsh-launcher\`
-2. 把 `start-dsh.bat` 复制到桌面（或自建快捷方式）
-3. 双击它 → **1 秒内不做任何输入** 自动启动 dsh；**按任意键** 进入菜单
+**本仓库是唯一发布源**，直接 clone 即可（所需文件全部在仓库内，无外部依赖）：
+
+```bat
+git clone https://github.com/master666-max/dsh-launcher.git "%USERPROFILE%\dsh-launcher"
+```
+
+1. 上面这条命令把工具链放到 `%USERPROFILE%\dsh-launcher\`
+2. 把仓库里的 **`start-dsh.bat`** 复制到桌面；
+   `结束-dsh.bat`（停止脚本）建议也一起复制
+3. 双击 `start-dsh.bat` → **1 秒内不做任何输入** 自动启动 dsh；**按任意键** 进入菜单
+
+> 更新：`cd %USERPROFILE%\dsh-launcher && git pull`
+> ⚠️ 仓库用 `.gitattributes` 把 `*.bat` 钉死为 **CRLF** ——
+> 这是必须的（裸 LF 的 bat 双击会秒退），别删那条规则。
+>
+> ⚠️ **桌面上的 `start-dsh.bat` / `结束-dsh.bat` 只是副本。**
+> 要改启动逻辑请改**仓库里那份**，再复制到桌面。
+> 反过来改（只改桌面）会 drift —— 下次 `git pull` 覆盖不回来，
+> 而且换台机器就丢了。**仓库是唯一真相，桌面只是入口。**
 
 菜单：
 
@@ -37,6 +53,8 @@
 | `dsh-accept.py` | **一键验收**：静态自检 + 31 回归用例 + bat 语法闸 + 解释器探测 + 行尾检查 |
 | `dsh-mutate.py` | **变异测试**：故意改坏 12 处关键逻辑，验证回归用例真能抓到 |
 | `dsh-env.py` | 命令行薄壳（`--dump` / `--refresh` / `--json`） |
+| `start-dsh.bat` | **启动入口**（复制到桌面用）。薄壳：PATH 钉扎 + 转交 `dsh-launcher.py` |
+| `结束-dsh.bat` | **停止脚本**（复制到桌面用）。netstat+taskkill 结束占用 3080 的进程 |
 | `MAINTENANCE.md` | **维护与审计说明**（故障速查、审计要点、改动纪律） |
 
 ## 改完代码后必做

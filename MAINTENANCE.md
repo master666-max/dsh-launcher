@@ -29,15 +29,31 @@
 | `dsh-accept.py` | **一键验收**：静态自检 + 31 回归用例 + bat 语法闸 + 解释器探测 + 行尾，一次跑齐 | 子进程调上面两个 |
 | `dsh-mutate.py` | **变异测试**：故意改坏 12 处关键逻辑，验证用例真能抓到回归 | 在 tempfile 副本上跑 dsh_tests.py |
 | `dsh-env.py` | 命令行薄壳（`--dump` / `--refresh` / `--json`），实现都在 dsh_env.py | import dsh_env |
+| `start-dsh.bat` | **启动入口**（复制到桌面用）。薄壳：PATH 钉扎 + 转交 `dsh-launcher.py` | 无 |
+| `结束-dsh.bat` | **停止脚本**（复制到桌面用）。netstat+taskkill 释放 3080 | 无 |
+| `.gitattributes` | 行尾策略：`*.bat` 钉死 CRLF（裸 LF 会秒退）、`*.py`/`*.md` 用 LF | — |
 
 数据/缓存（可随时删除，会自动重建）：
 `dsh-env.cache.json`（探测缓存）、`dsh-dump.cache.txt` + `.meta.json`（权威插件树缓存）。
 
 
 
-### 配套的「停止 dsh」脚本
-桌面还有 ：用 netstat+taskkill 结束占用 3080 的进程。
-它**不依赖任何目录**（只用 netstat/taskkill），与本套工具无路径耦合。
+### 配套的两个 .bat（都在仓库里，clone 后复制到桌面即可）
+- `start-dsh.bat` —— 启动入口。薄壳：只做 PATH 钉扎 + 转交 `dsh-launcher.py`
+- `结束-dsh.bat` —— 结束 dsh，释放 3080 端口
+
+`结束-dsh.bat` 用 `netstat` + `taskkill` 结束占用 3080 的进程，
+**不依赖任何目录**（只用 netstat/taskkill），与本套工具无路径耦合。
+
+> ⚠️ 它**只按端口判断、不校验那个进程是不是 dsh** ——
+> 这是为了让脚本保持「零依赖、单文件」而做的取舍。
+> 若 3080 上跑的是别的东西，**不要双击它**。
+> （启动器内部那套 `kill_leftover` 是严格的：要求 HTTP 401 + 正文含
+> `authentication required` + 含 `dsh web`，并做 `pid_is_node` 复核。）
+
+> ⚠️ **`.bat` 必须纯 CRLF**，仓库已用 `.gitattributes` 的 `*.bat text eol=crlf`
+> 钉死 —— 这样无论 clone 方的 `core.autocrlf` 怎么设，checkout 出来的都是 CRLF。
+> 别删这条规则，否则 Linux/macOS 上 clone 到的 bat 会是裸 LF，双击必秒退。
 注意：强杀会留下脏锁，启动器已在下次启动时自动清理。
 
 ## 三、日常操作
