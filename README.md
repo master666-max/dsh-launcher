@@ -94,3 +94,7 @@ python dsh-env.py --refresh  :: dsh 升级或换目录后强制重探
 - `dsh-dump.cache.txt` (+ `.meta.json`) —— 权威插件树缓存
 
 它们包含**本机真实路径**，请勿提交到公开仓库。
+
+## 许可
+
+**MIT** —— 见 [LICENSE](LICENSE)。
