@@ -36,6 +36,11 @@ MUTANTS = [
     ("[env] cmd_arg_safe 恒 True（元字符校验失效）", "dsh_env.py",
      "return isinstance(p, str) and _CMD_UNSAFE.search(p) is None",
      "return True"),
+    # [层6] 2026-09-25：端口被系统排除范围吞掉（listen EACCES）——
+    # 命中判断改坏后，3080 被吞时启动器不再提前报警（用户白等两分钟）。
+    ("[env] 层6 排除范围命中判断恒 False", "dsh_env.py",
+     "        if lo <= port <= hi:",
+     "        if False:"),
     ("[plugins] set_disabled 退回不看缩进层", "dsh-plugins.py",
      '                if ci == k and re.match(r"^\\s*disabled:\\s*", cur):',
      '                if re.match(r"^\\s*disabled:\\s*", cur):'),

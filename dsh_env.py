@@ -840,6 +840,66 @@ def split_win_cmdline(s):
     return out
 
 
+_re_excl = _re_mod.compile(r"^\s*(\d+)\s+(\d+)\s*\*?\s*$", _re_mod.M)
+
+
+def _parse_excluded_ranges(out):
+    """[层6] 从 `netsh ... show excludedportrange protocol=tcp` 输出解析范围对。
+
+    只认「两个纯数字列」的行（表体）；标题/分隔线/带 * 说明行自然跳过。
+    """
+    return [(int(m.group(1)), int(m.group(2))) for m in _re_excl.finditer(out)]
+
+
+def _port_in_ranges(port, ranges):
+    """[层6] 端口是否落在任一 [lo, hi] 内（netsh 表为含端点的闭区间）。"""
+    for lo, hi in ranges:
+        if lo <= port <= hi:
+            return True
+    return False
+
+
+def port_excluded(port, timeout=15):
+    """[层6] 端口是否被 Windows 排除端口范围吞掉（listen 必 EACCES）。
+
+    背景（2026-09-25 定案）：Hyper-V / WSL2 / winnat 每次重启动态保留大段
+    端口；落在其中的端口**即使 netstat 无人监听**，bind 也会被拒
+    （errno -4092, listen EACCES）—— 与「端口被占（EADDRINUSE）」完全不同。
+    netsh 不可用/失败时保守返回 (False, None)：探测不到 ≠ 不在范围，
+    但宁可放过也不误报（误报会让用户白修）。
+    """
+    try:
+        r = subprocess.run(["netsh", "interface", "ipv4", "show",
+                            "excludedportrange", "protocol=tcp"],
+                           capture_output=True, timeout=timeout)
+        out = r.stdout.decode("gbk", errors="replace")
+    except Exception:
+        return False, None
+    for lo, hi in _parse_excluded_ranges(out):
+        if _port_in_ranges(port, ((lo, hi),)):
+            return True, (lo, hi)
+    return False, None
+
+
+def _l6_note(port_value, notes):
+    """[层6] 探测并把结果写进 notes（命中=给出管理员修复指引）。"""
+    try:
+        pno = int(port_value)
+    except (TypeError, ValueError):
+        return None, None
+    hit, rng = port_excluded(pno)
+    if hit:
+        notes.append(
+            "[层6] 端口 %d 落在系统排除范围 [%d, %d] —— 启动必然 listen EACCES。"
+            "修复（管理员终端执行）：net stop winnat；"
+            "netsh int ipv4 add excludedportrange protocol=tcp "
+            "startport=%d numberofports=1 store=persistent；net start winnat"
+            % (pno, rng[0], rng[1], pno))
+    else:
+        notes.append("[层6] 端口 %d 不在系统排除范围内" % pno)
+    return hit, rng
+
+
 def discover_start_cmds(repo, profile_name, cfg, notes):
     """返回 [{label, argv}]，按可靠性排序。
 
@@ -903,20 +963,25 @@ def discover_start_cmds(repo, profile_name, cfg, notes):
             chosen = w; break
 
     if chosen:
-        push("dsh %s" % chosen, ["cmd.exe", "/c", pm, "dsh", chosen])
+        push("dsh %s（官方：help 探测确认的子命令）" % chosen,
+             ["cmd.exe", "/c", pm, "dsh", chosen])
     if prof_ok and prof != chosen:
         push("dsh --profile %s %s" % (prof, chosen or "web"),
              ["cmd.exe", "/c", pm, "dsh", "--profile", prof, chosen or "web"])
 
     for s in ("web", "serve", "start"):
-        push("dsh %s" % s, ["cmd.exe", "/c", pm, "dsh", s])
+        # [!] 不带 --profile 的 serve/start 在被测应用上会立即退出（候选空转两轮，
+        #     未闭合清单在案）。保留是为了可观察；标注让人不必再等。
+        _tag = "（缺 --profile 会立即退）" if s != "web" else ""
+        push("dsh %s%s" % (s, _tag), ["cmd.exe", "/c", pm, "dsh", s])
 
     # tsx 源码入口（一定是最新代码，但每次现编译，慢）
     for entry in (os.path.join("apps", "cli", "src", "bin.ts"),
                   os.path.join("apps", "cli", "src", "bin.js"),
                   os.path.join("apps", "cli", "bin.js")):
         if os.path.exists(os.path.join(repo, entry)):
-            push("node %s %s" % (entry, prof),
+            push("node --import tsx/esm %s %s（源码现编译：最新但最慢）"
+                 % (entry, prof),
                  ["cmd.exe", "/c", "node", "--import", "tsx/esm", entry, prof])
             break
 
@@ -1169,6 +1234,7 @@ def detect(force=False, want_dump=False):
             if not any("缓存" in x for x in (r.get("notes") or [])):
                 r.setdefault("notes", []).append(
                     "使用上次探测结果的缓存（仓库未变动）；菜单[5]可强制重探")
+            _l6_note((r.get("port") or {}).get("value"), r["notes"])
             _MEMO["r"] = copy.deepcopy(r)
             return r
 
@@ -1180,6 +1246,11 @@ def detect(force=False, want_dump=False):
     feats = find_features(profile, notes)
     start = discover_start_cmds(repo["path"] if repo else None,
                                 profile["name"] if profile else None, cfg, notes)
+
+    # [层6] 服务端口被系统排除范围吞掉 → listen EACCES（2026-09-25 定案）。
+    # netstat 看起来「没人监听」，bind 却被拒；症状是 dsh 跑到 webserver 才崩
+    # （两分钟级）。提前探测，命中即给管理员修复指引，别让用户白等。
+    _l6_note((port or {}).get("value"), notes)
 
     if repo:
         notes.append("仓库：%s（得分 %d，来源 %s）"

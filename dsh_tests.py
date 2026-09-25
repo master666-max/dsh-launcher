@@ -1001,6 +1001,25 @@ def main():
     return 0
 
 
+@case("层6：排除端口范围解析 + 命中判断（含边界值）")
+def t_l6_excluded_ranges():
+    sample = (
+        "\n协议 tcp 端口排除范围\n\n开始端口    结束端口\n"
+        "----------    --------\n      1183        1282\n"
+        "      3066        3165\n      50000       50059     *\n"
+        "\n* - 管理的端口排除。\n")
+    ranges = dsh_env._parse_excluded_ranges(sample)
+    expect((1183, 1282) in ranges, "应解析出 (1183,1282)")
+    expect((3066, 3165) in ranges, "应解析出 (3066,3165)")
+    expect((50000, 50059) in ranges, "带 * 的管理性排除也要解析出")
+    expect(len(ranges) == 3, "标题/分隔线/说明行不应产生假范围（实际 %r）" % ranges)
+    expect(dsh_env._port_in_ranges(3080, ranges) is True, "3080 落在 [3066,3165] → 命中")
+    expect(dsh_env._port_in_ranges(3066, ranges) is True, "边界值 3066（闭区间）→ 命中")
+    expect(dsh_env._port_in_ranges(3165, ranges) is True, "边界值 3165（闭区间）→ 命中")
+    expect(dsh_env._port_in_ranges(3300, ranges) is False, "3300 不在任何范围 → 不命中")
+    expect(dsh_env._port_in_ranges(1283, ranges) is False, "1283 恰在两范围缝隙 → 不命中")
+
+
 if __name__ == "__main__":
     # dsh-plugins.py 文件名带连字符，需用 importlib 加载
     import importlib.util
