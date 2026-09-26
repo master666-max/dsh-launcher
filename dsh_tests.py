@@ -976,6 +976,123 @@ def t_dumpcache_size():
 
 
 # ============================================================
+# 8. 入口 bat：工具链目录定位（2026-09-26 去硬编码）
+# ============================================================
+# 背景：旧版把 TOOLS 写死成 %USERPROFILE%\dsh-launcher，与 README 的
+# 「零硬编码路径、整个目录可以随意搬动」自相矛盾 —— 换目录 clone 之后，
+# 桌面副本只会报「找不到启动器」。
+# 这里用【真 cmd.exe 跑真 bat】验证三级解析：显式 DSH_TOOLS > 就近 %~dp0
+# > 用户目录兜底，以及三处都没有时必须明确报错（不静默）。
+#
+# 手法与 dsh-accept.py 一致：把 bat 的【最后一行启动命令】截掉，
+# 换成 echo TOOLS=[%TOOLS%] —— 既不拉起 dsh，又能拿到真实解析结果。
+
+
+def _bat_probe_head():
+    """取仓库 start-dsh.bat 去掉最后一行（真正的启动命令）后的行。"""
+    p = os.path.join(T, "start-dsh.bat")
+    data = open(p, "rb").read()
+    lines = data.split(b"\r\n")
+    n = len(lines) - 1 if lines and lines[-1] == b"" else len(lines)
+    return lines[:n - 1]
+
+
+def _stub_launcher(d, nested=False):
+    """造占位 dsh-launcher.py —— bat 只做存在性判断，不会真去跑它。"""
+    target = os.path.join(d, "dsh-launcher", "dsh-launcher.py") if nested \
+        else os.path.join(d, "dsh-launcher.py")
+    os.makedirs(os.path.dirname(target), exist_ok=True)
+    open(target, "wb").close()
+
+
+def _probe_tools(bat_dir, env_extra):
+    """在 bat_dir 放一份探测 bat 跑一遍，返回 (rc, TOOLS 值, stdout)。"""
+    head = _bat_probe_head()
+    gp = os.path.join(bat_dir, "probe.bat")
+    open(gp, "wb").write(b"\r\n".join(head)
+                         + b"\r\necho TOOLS=[%TOOLS%]\r\nexit /b 0\r\n")
+    env = os.environ.copy()
+    env.pop("DSH_TOOLS", None)          # 默认场景：外部没设过
+    env.update(env_extra)
+    r = subprocess.run(["cmd.exe", "/c", gp], capture_output=True,
+                       stdin=subprocess.DEVNULL, timeout=60, env=env)
+    out = r.stdout.decode("gbk", "replace")
+    val = ""
+    for l in out.splitlines():
+        if "TOOLS=[" in l:
+            val = l.split("TOOLS=[", 1)[1].split("]", 1)[0]
+    return r.returncode, val, out
+
+
+@case("bat 定位 TOOLS：就近（%~dp0）优先 —— 目录可随意搬动")
+def t_bat_tools_colocated():
+    a = tempfile.mkdtemp(prefix="dsh_bat_a_")
+    b = tempfile.mkdtemp(prefix="dsh_bat_b_")
+    try:
+        _stub_launcher(a)                     # 与 bat 同目录
+        _stub_launcher(b, nested=True)        # 用户目录兜底位
+        rc, val, out = _probe_tools(a, {"USERPROFILE": b})
+        expect(rc == 0, "探测 bat 应 rc=0，实际 %d：%s" % (rc, out[-200:]))
+        expect(os.path.normcase(val) == os.path.normcase(a),
+               "应优先用 bat 所在目录 %s（可搬移），实得 %r" % (a, val))
+        expect(not val.endswith("\\"),
+               "TOOLS 不应带尾部反斜杠（否则拼出双反斜杠），实得 %r" % val)
+    finally:
+        shutil.rmtree(a, ignore_errors=True)
+        shutil.rmtree(b, ignore_errors=True)
+
+
+@case("bat 定位 TOOLS：DSH_TOOLS 显式覆盖优先于就近与兜底")
+def t_bat_tools_env_override():
+    a = tempfile.mkdtemp(prefix="dsh_bat_a_")
+    b = tempfile.mkdtemp(prefix="dsh_bat_b_")
+    c = tempfile.mkdtemp(prefix="dsh_bat_c_")
+    try:
+        _stub_launcher(a)
+        _stub_launcher(b, nested=True)
+        _stub_launcher(c)                     # 显式指定的那个
+        rc, val, out = _probe_tools(a, {"USERPROFILE": b, "DSH_TOOLS": c})
+        expect(rc == 0, "探测 bat 应 rc=0，实际 %d：%s" % (rc, out[-200:]))
+        expect(os.path.normcase(val) == os.path.normcase(c),
+               "DSH_TOOLS=%s 应压过就近 %s，实得 %r" % (c, a, val))
+    finally:
+        shutil.rmtree(a, ignore_errors=True)
+        shutil.rmtree(b, ignore_errors=True)
+        shutil.rmtree(c, ignore_errors=True)
+
+
+@case("bat 定位 TOOLS：bat 旁边没有时回退 %USERPROFILE%\\dsh-launcher（桌面副本场景）")
+def t_bat_tools_userprofile_fallback():
+    a = tempfile.mkdtemp(prefix="dsh_bat_a_")     # 故意不放 dsh-launcher.py
+    b = tempfile.mkdtemp(prefix="dsh_bat_b_")
+    try:
+        _stub_launcher(b, nested=True)
+        rc, val, out = _probe_tools(a, {"USERPROFILE": b})
+        expect(rc == 0, "兜底命中时应 rc=0，实际 %d：%s" % (rc, out[-200:]))
+        want = os.path.join(b, "dsh-launcher")
+        expect(os.path.normcase(val) == os.path.normcase(want),
+               "应回退到 %s（桌面副本的老行为，必须向后兼容），实得 %r"
+               % (want, val))
+    finally:
+        shutil.rmtree(a, ignore_errors=True)
+        shutil.rmtree(b, ignore_errors=True)
+
+
+@case("bat 定位 TOOLS：三处都没有 -> 明确报错退出（不静默、不乱跑）")
+def t_bat_tools_not_found():
+    a = tempfile.mkdtemp(prefix="dsh_bat_a_")
+    b = tempfile.mkdtemp(prefix="dsh_bat_b_")
+    try:
+        rc, val, out = _probe_tools(a, {"USERPROFILE": b})
+        expect(rc != 0, "三处都没有时应非 0 退出，实际 rc=%d" % rc)
+        expect("找不到启动器" in out,
+               "应打印可读报错（而不是静默失败），实际 %r" % out[-200:])
+    finally:
+        shutil.rmtree(a, ignore_errors=True)
+        shutil.rmtree(b, ignore_errors=True)
+
+
+# ============================================================
 # 运行
 # ============================================================
 def main():

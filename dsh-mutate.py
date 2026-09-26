@@ -71,6 +71,16 @@ MUTANTS = [
     ("[env] lock_is_stale 复用复核恒失效（!= node.exe 改成 False）", "dsh_env.py",
      '            if actual is not None and actual.lower() != "node.exe":',
      '            if False:'),
+    # ---- 2026-09-26 新增：入口 bat 的 TOOLS 三级解析守护 ----
+    # [!] .bat 的锚点按 GBK 字节替换（见主循环里的字节分支）——
+    #     文本模式会把 CRLF 折成 LF，变异体会因「裸 LF 秒退」被假抓到，
+    #     看着是 [抓到]，守护的却是一条与锚点无关的性质。
+    ("[bat] 去掉就近（dp0）分支 —— 目录又变回不可搬移", "start-dsh.bat",
+     'if not defined TOOLS if exist "%~dp0dsh-launcher.py" for %%I in ("%~dp0.") do set "TOOLS=%%~fI"',
+     "rem MUTANT: colocated branch removed"),
+    ("[bat] DSH_TOOLS 显式覆盖被忽略", "start-dsh.bat",
+     'if defined DSH_TOOLS if exist "%DSH_TOOLS%\\dsh-launcher.py" for %%I in ("%DSH_TOOLS%.") do set "TOOLS=%%~fI"',
+     "rem MUTANT: env override removed"),
 ]
 
 caught = missed = skipped = 0
@@ -78,17 +88,30 @@ for name, fname, old, new in MUTANTS:
     sp = os.path.join(T, fname)
     if not os.path.exists(sp):
         print("[跳过] 无文件 %s" % fname); skipped += 1; continue
-    src = open(sp, encoding="utf-8").read()
-    if old not in src:
-        print("[跳过] 锚点不匹配：%s" % name); skipped += 1; continue
+    # [!] .bat 是 GBK + 纯 CRLF：锚点比对与改写都必须走【字节】。
+    #     用文本模式读写会把 CRLF 折成 LF，变异体就变成「裸 LF 秒退」——
+    #     测试确实会红，但红的原因与锚点无关，等于骗自己。
+    is_bat = fname.endswith(".bat")
+    if is_bat:
+        raw = open(sp, "rb").read()
+        if old.encode("gbk") not in raw:
+            print("[跳过] 锚点不匹配：%s" % name); skipped += 1; continue
+    else:
+        src = open(sp, encoding="utf-8").read()
+        if old not in src:
+            print("[跳过] 锚点不匹配：%s" % name); skipped += 1; continue
     d = tempfile.mkdtemp()
     try:
         for f in os.listdir(T):
             p = os.path.join(T, f)
-            if os.path.isfile(p) and f.endswith(".py"):
+            if os.path.isfile(p) and f.endswith((".py", ".bat")):
                 shutil.copy2(p, os.path.join(d, f))
-        open(os.path.join(d, fname), "w", encoding="utf-8").write(
-            src.replace(old, new, 1))
+        if is_bat:
+            open(os.path.join(d, fname), "wb").write(
+                raw.replace(old.encode("gbk"), new.encode("gbk"), 1))
+        else:
+            open(os.path.join(d, fname), "w", encoding="utf-8").write(
+                src.replace(old, new, 1))
         r = subprocess.run([PY, os.path.join(d, "dsh_tests.py")],
                            capture_output=True, timeout=300)
         out = (r.stdout + r.stderr).decode("utf-8", "replace")

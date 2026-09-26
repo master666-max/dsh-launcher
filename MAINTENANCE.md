@@ -24,12 +24,12 @@
 | `dsh-launcher.py` | 编排 + 交互菜单：启动 dsh、调自愈、调插件工具。**只做编排，不含 dsh 内部知识** | import dsh_env |
 | `dsh-plugins.py` | 插件管理：列出 181 个入口、冲突检查、启用/禁用（写 profile 补丁） | import dsh_env |
 | `dsh-fallback-heal.py` | 补齐 `.dsh-module-fallback` 缺失 junction（可子进程或直跑） | import dsh_env |
-| `dsh_tests.py` | **回归测试 31 用例**（改完代码必跑） | import dsh_env、加载 dsh-launcher/plugins |
+| `dsh_tests.py` | **回归测试 36 用例**（改完代码必跑） | import dsh_env、加载 dsh-launcher/plugins |
 | `dsh-selfcheck.py` | 静态自检：语法/缺失 import/未定义名/GBK 字符/subprocess 参数名/bat 行尾/解耦 | 无依赖 |
-| `dsh-accept.py` | **一键验收**：静态自检 + 31 回归用例 + bat 语法闸 + 解释器探测 + 行尾，一次跑齐 | 子进程调上面两个 |
-| `dsh-mutate.py` | **变异测试**：故意改坏 12 处关键逻辑，验证用例真能抓到回归 | 在 tempfile 副本上跑 dsh_tests.py |
+| `dsh-accept.py` | **一键验收**：静态自检 + 36 回归用例 + bat 语法闸 + 解释器探测 + 行尾，一次跑齐 | 子进程调上面两个 |
+| `dsh-mutate.py` | **变异测试**：故意改坏 14 处关键逻辑，验证用例真能抓到回归 | 在 tempfile 副本上跑 dsh_tests.py |
 | `dsh-env.py` | 命令行薄壳（`--dump` / `--refresh` / `--json`），实现都在 dsh_env.py | import dsh_env |
-| `start-dsh.bat` | **启动入口**（复制到桌面用）。薄壳：PATH 钉扎 + 转交 `dsh-launcher.py` | 无 |
+| `start-dsh.bat` | **启动入口**（复制到桌面用）。薄壳：定位工具链目录 + PATH 钉扎 + 转交 `dsh-launcher.py` | 无 |
 | `结束-dsh.bat` | **停止脚本**（复制到桌面用）。netstat+taskkill 释放 3080 | 无 |
 | `.gitattributes` | 行尾策略：`*.bat` 钉死 CRLF（裸 LF 会秒退）、`*.py`/`*.md` 用 LF | — |
 
@@ -39,8 +39,17 @@
 
 
 ### 配套的两个 .bat（都在仓库里，clone 后复制到桌面即可）
-- `start-dsh.bat` —— 启动入口。薄壳：只做 PATH 钉扎 + 转交 `dsh-launcher.py`
+- `start-dsh.bat` —— 启动入口。薄壳：定位工具链目录 + PATH 钉扎 + 转交 `dsh-launcher.py`
 - `结束-dsh.bat` —— 结束 dsh，释放 3080 端口
+
+**入口 bat 的工具链目录解析顺序**（2026-09-26 起，见 §七 变更记录）：
+1. 环境变量 `DSH_TOOLS` 指向的目录（显式覆盖，优先级最高）
+2. bat 自己所在目录（`%~dp0`）—— 仓库里那份直接双击，整目录搬走后 bat 跟着走
+3. `%USERPROFILE%\dsh-launcher` —— README 的默认安装位，桌面副本走这条
+
+三处都有 `dsh-launcher.py` 才算命中；都命中不了就报错并列出找过的位置。
+**三个来源统一用 `for` 的 `%%~fI` 归一化**（顺带去掉尾部反斜杠）——
+不要退回「子串取尾部反斜杠」的写法，那条路在变量为空时会 rc=255（见 §四 第 8 条）。
 
 `结束-dsh.bat` 用 `netstat` + `taskkill` 结束占用 3080 的进程，
 **不依赖任何目录**（只用 netstat/taskkill），与本套工具无路径耦合。
@@ -69,13 +78,13 @@ python dsh-accept.py        # 【推荐】一键跑齐下面三段 + 解释器�
 或者分步：
 ```
 python dsh-selfcheck.py     # 静态自检（0 问题才算完）
-python dsh_tests.py         # 31 用例回归（全过才算完）
+python dsh_tests.py         # 36 用例回归（全过才算完）
 python dsh-env.py --refresh # 强制重探（dsh 升级/换目录后）
 ```
 
 ### 动手改逻辑前：先跑变异测试
 ```
-python dsh-mutate.py       # 故意改坏 12 处关键逻辑，看用例抓不抓得到
+python dsh-mutate.py       # 故意改坏 14 处关键逻辑，看用例抓不抓得到
 ```
 **理由**：用例"全绿"不等于有用例。本项目实测过 —— `parse_dump` / `is_dsh_here` /
 `set_disabled` / `split_win_cmdline` / `clean_stale_locks` / `live_now` 六处关键修复
@@ -165,6 +174,30 @@ dsh 每次只建它需要的 220/285 个链接，多补的会被它删掉，
 - **清脏锁前必须确认 netstat 本身成功**：netstat 失败 ≠ 没有监听；
   前提证不出来就整轮放弃（与第 1 条的三重把关同向）。
 
+### 8. 括号块内的 `if` 不能与命令跨行（2026-09-18 秒退事故）
+cmd 在**从批处理文件调用**的场景下，只要 `for`/`if` 括号块里出现
+`if <条件>` 独占一行、下一行才跟命令（加不加括号、行尾有没有空格都一样），
+**整个块就会 rc=255 或静默中止** —— 表现又是双击后窗口还没打印就消失。
+唯一解：**`if` 与它的命令必须写在同一行**（链式 `if a if b 命令` 仍算同一行）。
+- 最小对照实测：原样 **rc=255** / 给 `if` 加括号 **rc=255** / 合并一行 **rc=0** /
+  去掉行尾空格 **rc=255**。
+- 守护：`dsh-selfcheck.py` 第 6 项常驻检测（会循环剥离链式条件，四种形态都在扫描面内）。
+
+### 9. 空变量上的子串展开会炸（2026-09-26 实测）
+`%VAR:~n%` 在 **VAR 未定义/为空**时 cmd **不做子串展开**，而是把 `~n` 原样留下
+（实测 `set "X="` + `echo [%X:~-1%]` → 输出 `[~-1]`）。
+一旦同一行里出现**两处**这类子串（典型：`if` 条件里取尾 + `set` 里去掉尾巴），
+整行变成 `rc=255 命令语法不正确`，并让**整个 bat 立即中止** ——
+症状与上一条几乎一样（秒退、stdout 0 字节），但成因完全不同。
+- 实测对照：空变量 + 同一行两处子串 = **必炸**；同一行只有一处 = 正常；
+  变量非空 = 正常（所以手测时若变量恰好有值，会误以为写法没问题）。
+- **结论**：永远不要用子串去判断/裁剪一个可能为空的变量。
+  需要去掉尾部反斜杠就用 `for %%I in ("路径.") do set "TOOLS=%%~fI"`。
+- 守护：`dsh_tests.py` 4 条真 cmd 用例覆盖入口 bat 的三级解析；
+  `dsh-mutate.py` 2 条变异体（去掉就近分支 / 忽略 `DSH_TOOLS`）盯着它们。
+  注意 bat 的变异体必须**按 GBK 字节**替换，文本模式会把 CRLF 折成 LF
+  → 测试虽然会红，但红的原因是「裸 LF 秒退」，与本条无关（假抓到）。
+
 ## 五、与 AI Agent / IDE 插件的解耦声明（已做到【完全】解耦）
 
 | 检查项 | 结果 |
@@ -190,7 +223,9 @@ dsh 每次只建它需要的 220/285 个链接，多补的会被它删掉，
 
 > 若本工具需要迁移到别的机器/别的用户名：整个 `dsh-launcher` 文件夹拷过去即可，
 > 代码内的路径全部从 `__file__` 推导，不含任何用户名硬编码。
-> 只需把桌面 `start-dsh.bat` 里的 `%USERPROFILE%\dsh-launcher` 保持默认即可。
+> 入口 bat 自 2026-09-26 起也不再写死安装位（见 §二 与 §七）：
+> 把 `start-dsh.bat` 放进那个目录、或设 `DSH_TOOLS` 指过去即可；
+> 桌面副本仍走 `%USERPROFILE%\dsh-launcher` 这个默认位，所以老用法不变。
 
 ## 六、常见故障速查
 
@@ -200,7 +235,8 @@ dsh 每次只建它需要的 220/285 个链接，多补的会被它删掉，
 | `EPERM: symlink` | fallback 竞态 | 菜单 [4] 手动补齐 |
 | 找不到 pnpm / 不是内部命令 | PATH 被裁剪 | bat 已做 PATH 钉扎；确认 `%APPDATA%\npm` 在 PATH |
 | 插件状态显示旧数据 | dump 缓存 | 菜单 [5] 或 `python dsh-env.py --refresh` |
-| **双击黑框闪一下就退** | **① .bat 行尾不是纯 CRLF　② 括号块内 `if` 与命令跨行（见四·8）** | **跑 `python dsh-accept.py`，它会同时查行尾、查跨行 if、并跑语法闸** |
+| **双击黑框闪一下就退** | **① .bat 行尾不是纯 CRLF　② 括号块内 `if` 与命令跨行（见四·8）　③ 空变量上的子串展开（见四·9）** | **跑 `python dsh-accept.py`，它会同时查行尾、查跨行 if、并跑语法闸** |
+| **报「找不到启动器 dsh-launcher.py」** | **工具链目录三级解析都没命中（见二·配套的两个 .bat）** | **① 把 bat 放进工具链目录（与 `dsh-launcher.py` 同级）② 设 `DSH_TOOLS` 指过去 ③ clone 到 `%USERPROFILE%\dsh-launcher`。报错里会列出找过的三个位置** |
 | **启动时 `plugin tree failed to load: ... ui-task-board`（退出码 1）** | **脏锁 + PID 被系统复用**：锁里记的 pid 已死、但被 Windows 复用给了别的程序（实测 31848 → `Nahimic3.exe`）。旧判据只看「pid 还活着吗」→ 误判成正常锁 → 不敢清 → 新 dsh 抢 task-board 锁失败 | 已修（2026-09-20，见第七章）：判据补「pid 活着但**不是 node.exe** = 已被复用 = 脏锁」。手动兜底：确认无 dsh 在跑后删 `~/.dsh/task-board/ledger-v2.lock` |
 
 ### 排「启动器秒退」的正确顺序（2026-09-18 实战总结）
@@ -228,6 +264,59 @@ dsh 每次只建它需要的 220/285 个链接，多补的会被它删掉，
 **判「整份文件」是否合法，必须用「全行 + 收尾片段」。**
 
 ## 七、变更记录
+
+### 2026-09-26　入口 bat 不再硬编码安装位：TOOLS 三级解析（目录可随意搬动）
+
+**症状（文档与实现对不上）**：README 的设计约束写着「零硬编码路径、整个目录可以
+随意搬动」，但 `start-dsh.bat` 里是 `set "TOOLS=%USERPROFILE%\dsh-launcher"`。
+换目录 clone（例如 `D:\tools\dsh-launcher`）之后，桌面副本只会报
+「找不到启动器: `%USERPROFILE%\dsh-launcher\dsh-launcher.py`」——
+工具链本身其实好好的。`.py` 那边确实零硬编码，**只有入口 bat 例外**。
+
+**修复**：`TOOLS` 改为三级解析 ——
+① `DSH_TOOLS` 环境变量 → ② bat 自己所在目录（`%~dp0`）→ ③ `%USERPROFILE%\dsh-launcher`。
+三处都没有才报错，并把**找过的三个位置全部列出来**（不让用户猜）。
+三个来源统一用 `for %%I in ("路径.") do set "TOOLS=%%~fI"` 归一化，
+顺带去掉尾部反斜杠，避免拼出双反斜杠。
+
+**踩到的坑（实测钉死，已写进 §四 第 9 条）**：第一版用
+`if "%TOOLS:~-1%"=="\" set "TOOLS=%TOOLS:~0,-1%"` 去尾巴 ——
+`TOOLS` 为空时 `rc=255 命令语法不正确`、**整份 bat 中止、stdout 0 字节**，
+又变成"双击秒退"。根因：空变量上的 `%VAR:~n%` 不展开，`~-1` 被原样留在行里，
+同一行两处子串必炸。改用 `for` 取值后消失。
+
+**守护（本次新增）**：
+- `dsh_tests.py`：4 条**真 cmd 跑真 bat** 的用例（就近优先 / `DSH_TOOLS` 覆盖 /
+  用户目录兜底 / 三处都没有必须报错）。手法沿用 `dsh-accept.py` 的
+  「截掉最后一行启动命令 + 注入 `echo TOOLS=[%TOOLS%]`」，不拉起 dsh。
+- `dsh-mutate.py`：新增 2 条 bat 变异体（去掉就近分支 / 忽略 `DSH_TOOLS`），
+  并把变异器的复制面扩到 `*.bat`、**bat 一律按 GBK 字节替换**。
+
+**before / after 证据**（同一套用例，改动前后各跑一遍真 cmd）：
+
+```
+改动前（git HEAD 的 bat）：用例 36 个，失败 2 个
+  [x] bat 定位 TOOLS：就近（%~dp0）优先 —— 目录可随意搬动
+  [x] bat 定位 TOOLS：DSH_TOOLS 显式覆盖优先于就近与兜底
+改动后                    ：用例 36 个，失败 0 个
+```
+
+另外两条用例（用户目录兜底、三处都没有要报错）在改动前**也是通过的**：
+它们锁的是向后兼容，不是本次修复 —— 放在一起是为了防止
+「修好可搬移、却把桌面副本弄坏」。
+
+> ⚠️ 复现 before 基线时注意：`git show HEAD:start-dsh.bat` 拿到的是**索引里的 LF blob**
+> （`.gitattributes` 规定入库 LF、checkout 才转 CRLF）。直接拿它当"改动前的 bat"跑，
+> 会得到一份**裸 LF** 的 bat，测出来的是"秒退"而不是老逻辑 ——
+> 本次就踩了这个坑，第一轮 before 数据全是假的。**必须先转成纯 CRLF 再喂给用例。**
+
+**顺带发现（未修，与本条改动无关）**：本次在 `80b8d8f` 的干净 worktree 上复跑变异测试，
+结果是 **抓到 12 / 漏掉 1 / 跳过 0** —— 漏掉的是
+`[launcher] run_heal deep 也被跳过`。也就是说 §七 2026-09-20 里
+「12 条全抓到」的说法**已经过期**：`run_heal` 的实现演进后，
+用例不再能抓住"deep 也被跳过"这一处退化（同样跑绿的还有它的兄弟变异体）。
+锚点没失效（无 `[跳过]`），是**断言覆盖**不够 —— 按 §三「动手改逻辑前」的纪律，
+这条修复目前处于裸奔状态，建议后续单独补一条断言（本次改动不碰 `run_heal`，故未一并修）。
 
 ### 2026-09-20　修复脏锁误判：PID 被系统复用 → 不清锁 → dsh 抢锁崩
 
@@ -471,13 +560,13 @@ set HTTPS_PROXY=
 
 ### 提交前自检
 ```bat
-python dsh-accept.py        :: 一键跑齐：静态自检 + 31 回归用例 + bat 语法闸 + 行尾
+python dsh-accept.py        :: 一键跑齐：静态自检 + 36 回归用例 + bat 语法闸 + 行尾
 ```
 
 单独跑也可以：
 ```bat
 python dsh-selfcheck.py      :: 含解耦检查 + bat 行尾 + 块内跨行 if 检查
-python dsh_tests.py          :: 31 用例
+python dsh_tests.py          :: 36 用例
 ```
 
 ### 排「启动器秒退」的最小步骤
