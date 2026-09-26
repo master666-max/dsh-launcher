@@ -498,6 +498,40 @@ def t_pkgmgr():
 # ============================================================
 # 6. run_heal 的跳过逻辑（启动路径不白干）
 # ============================================================
+# 缺失状态样本：驱动 run_heal 各分支的受控数值（total, before）
+HEAL_STATES = [
+    ("完整(缺失 0)",      (285, 0)),
+    ("正常态(缺 65/285)", (285, 65)),
+    ("缺失过半(200/285)", (285, 200)),
+    ("探测失败(抛异常)",  (None, None)),
+]
+
+
+def _mk_fake_list_pkgs(total, before):
+    """受控 list_pkgs 替身：奇数次调用给 total 个包，偶数次给 total-before 个。
+
+    total is None = **抛异常**模拟探测失败 —— counts() 只在异常时返回 (None, None)，
+    返回空集只会得到 total=0/before=0（那是"本来就完整"，不是"探测失败"），
+    两者在生产代码里走的是完全不同的分支。
+
+    [!] run_heal 的分支判据必须由受控数值驱动，不能靠本机真实缺失量 ——
+        真机上"恰好不落在某个分支"会让变异体静默溜过去。
+        2026-09-26 实测：deep 路径原先就是裸跑真环境（本机恰好 before ≥ total*0.5），
+        于是「deep 也被跳过」这条退化在本地一直抓不到。
+    """
+    seq = {"n": 0}
+
+    def fake_lp(path):
+        seq["n"] += 1
+        if total is None:
+            raise OSError("模拟 list_pkgs 探测失败")
+        # 第一次调用(total) 返回 total 个包；第二次(缺) 返回 total-before 个包
+        if seq["n"] % 2 == 1:
+            return set("pkg%d" % i for i in range(total))
+        return set("pkg%d" % i for i in range(total - before))
+    return fake_lp
+
+
 @case("run_heal：启动路径跳过/执行的分支判据与生产代码一致（子进程全拦截）")
 def t_run_heal():
     import importlib.util as _ilu
@@ -529,26 +563,10 @@ def t_run_heal():
         # 这里直接**驱动 run_heal 在四种缺失状态下的真实分支**，
         # 靠替身 list_pkgs 喂入受控数值，断言调用次数 = 生产代码的语义。
         # ------------------------------------------------------------
-        for name, (total, before) in [
-                ("完整(缺失 0)",      (285, 0)),
-                ("正常态(缺 65/285)", (285, 65)),
-                ("缺失过半(200/285)", (285, 200)),
-                ("探测失败(None)",    (None, None)),
-        ]:
+        for name, (total, before) in HEAL_STATES:
             real_lp = dsh_env.list_pkgs
-            seq = {"n": 0}
-
-            def fake_lp(path, _t=total, _b=before):
-                seq["n"] += 1
-                if _t is None:
-                    return set()
-                # 第一次调用(total) 返回 t 个包；第二次(缺) 返回 t-b 个包
-                if seq["n"] % 2 == 1:
-                    return set("pkg%d" % i for i in range(_t if _t else 0))
-                return set("pkg%d" % i for i in range((_t - _b) if _t else 0))
-
             calls.clear()
-            dsh_env.list_pkgs = fake_lp
+            dsh_env.list_pkgs = _mk_fake_list_pkgs(total, before)
             try:
                 ok, msg = L.run_heal(env)          # 启动路径
             finally:
@@ -565,10 +583,33 @@ def t_run_heal():
                        "[%s] 缺失过半时启动路径应执行自愈子进程，实际 %d 次（msg=%s）"
                        % (name, len(calls), msg))
 
-        # 手动路径（deep=True）：无视上述判断，必须真调用
-        calls.clear()
-        L.run_heal(env, deep=True)
-        expect(len(calls) == 1, "deep=True 必须真正调用自愈脚本，实际 %d 次" % len(calls))
+        # ------------------------------------------------------------
+        # 手动路径（deep=True）：无视「正常态」判断，必须真调用；
+        # 但**计数拿不到时仍然不能瞎调**（total is None 在判断之前就返回了）。
+        # [!] 这段过去是"裸跑真环境"的：deep=True 只无参调一次，是否跳过取决于
+        #     本机真实缺失量 —— 本机恰好 before >= total*0.5，于是
+        #     「deep 也被跳过」这条退化在本地一直抓不到。改成受控数值驱动后才
+        #     与实现脱钩（与本文件上面那句注释同一个道理）。
+        # ------------------------------------------------------------
+        for name, (total, before) in HEAL_STATES:
+            real_lp = dsh_env.list_pkgs
+            calls.clear()
+            dsh_env.list_pkgs = _mk_fake_list_pkgs(total, before)
+            try:
+                ok, msg = L.run_heal(env, deep=True)      # 菜单 [4] 路径
+            finally:
+                dsh_env.list_pkgs = real_lp
+
+            if total is None:
+                expect(len(calls) == 0,
+                       "[deep][%s] 计数拿不到时不该调子进程，实际 %d 次（msg=%s）"
+                       % (name, len(calls), msg))
+            else:
+                expect(len(calls) == 1,
+                       "[deep][%s] deep=True 必须无视「正常态」真调用，实际 %d 次（msg=%s）"
+                       % (name, len(calls), msg))
+                # 不断言 ok：替身是无状态的（自愈后再数仍是同样缺失），
+                # 于是生产代码会如实返回 "仍有 N 个缺失"。本条锁的是「调没调」。
     finally:
         L.subprocess = real_sub
 

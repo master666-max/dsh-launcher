@@ -50,6 +50,13 @@ MUTANTS = [
     ("[launcher] run_heal deep 也被跳过", "dsh-launcher.py",
      "if not deep and total and before < total * 0.5:",
      "if total and before < total * 0.5:"),
+    # [2026-09-26] 这条以前**抓不到**，不是漏网，是根本没覆盖：
+    # 旧替身在"探测失败"时返回空集 → counts() 给出 total=0/before=0 →
+    # 走的是"本来就完整"分支，`total is None` 那条提前返回从没被执行过。
+    # 改成抛异常模拟探测失败之后，这条才真正有断言撑着。
+    ("[launcher] run_heal 计数失败时不提前返回（瞎补链接）", "dsh-launcher.py",
+     '    if total is None:\n        return True, "无法核对链接状态（跳过）"',
+     '    if False:\n        return True, "无法核对链接状态（跳过）"'),
     ("[launcher] live_now 只看 DEFAULT_PORTS", "dsh-launcher.py",
      """    ports = []
     if env and env.get("port"):
