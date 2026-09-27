@@ -54,9 +54,9 @@ git clone https://github.com/master666-max/dsh-launcher.git "%USERPROFILE%\dsh-l
 | `dsh-launcher.py` | 编排 + 交互菜单。**不含任何 dsh 内部知识** |
 | `dsh-plugins.py` | 插件管理：列出全部入口、冲突检查、启用/禁用（写 profile 补丁） |
 | `dsh-fallback-heal.py` | 补齐 `.dsh-module-fallback` 缺失 junction |
-| `dsh_tests.py` | **回归测试（36 用例）**，写操作全在临时副本上 |
-| `dsh-selfcheck.py` | 静态自检：语法 / 缺失 import / 未定义名 / GBK 字符 / subprocess 参数名 / bat 行尾 / 解耦 |
-| `dsh-accept.py` | **一键验收**：静态自检 + 36 回归用例 + bat 语法闸 + 解释器探测 + 行尾检查 |
+| `dsh_tests.py` | **回归测试（38 用例）**，写操作全在临时副本上 |
+| `dsh-selfcheck.py` | 静态自检：语法 / 缺失 import / 未定义名 / GBK 字符 / subprocess 参数名 / bat 行尾 / 解耦（关键词黑名单 + **绝对路径白名单**） |
+| `dsh-accept.py` | **一键验收**：静态自检 + 38 回归用例 + bat 语法闸 + 解释器探测 + 行尾检查 |
 | `dsh-mutate.py` | **变异测试**：故意改坏 16 处关键逻辑，验证回归用例真能抓到 |
 | `dsh-env.py` | 命令行薄壳（`--dump` / `--refresh` / `--json`） |
 | `start-dsh.bat` | **启动入口**（复制到桌面用）。薄壳：定位工具链目录 + PATH 钉扎 + 转交 `dsh-launcher.py` |
@@ -71,7 +71,7 @@ python dsh-accept.py         :: 【推荐】一键跑齐下面三段 + 解释器
 分步跑也可以：
 ```bat
 python dsh-selfcheck.py      :: 静态自检，0 问题才算完
-python dsh_tests.py          :: 36 用例回归，全过才算完
+python dsh_tests.py          :: 38 用例回归，全过才算完
 python dsh-env.py --refresh  :: dsh 升级或换目录后强制重探
 ```
 

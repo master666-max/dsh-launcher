@@ -1134,6 +1134,57 @@ def t_bat_tools_not_found():
 
 
 # ============================================================
+# 9. 启动判定兜底 + 解耦白名单（2026-09-19 第一性审计的补强）
+# ============================================================
+@case("live_now：候选端口全落空时 node 全端口扫描兜底（判定盲点）")
+def t_live_now_fallback():
+    L = _load_launcher('dsh_launcher_fb')
+    fake_env = {"port": {"value": 9999, "source": "t", "alive": False}}
+    real = (dsh_env.is_dsh_here, dsh_env.dsh_running_any_port)
+    try:
+        dsh_env.is_dsh_here = lambda p: False            # 候选端口全不中
+        dsh_env.dsh_running_any_port = lambda: True      # 兜底扫到表外端口
+        expect(L.live_now(fake_env) is True,
+               "兜底扫描发现 dsh 必须判 True（旧版误判失败 → 拉第二个实例）")
+        dsh_env.dsh_running_any_port = lambda: False
+        expect(L.live_now(fake_env) is False, "兜底也没有 → False")
+    finally:
+        dsh_env.is_dsh_here, dsh_env.dsh_running_any_port = real
+
+
+@case("selfcheck 白名单判定器：agent 目录命中、白名单放行、占位符跳过")
+def t_path_verdict():
+    import io as _io
+    import contextlib
+    import importlib.util as _ilu
+    _s = _ilu.spec_from_file_location('dsh_selfcheck_t',
+                                      os.path.join(T, 'dsh-selfcheck.py'))
+    buf = _io.StringIO()
+    with contextlib.redirect_stdout(buf):
+        S = _ilu.module_from_spec(_s)
+        _s.loader.exec_module(S)          # 会真跑一遍扫描（输出被吞掉）
+    home = S.HOME_DIR
+    # [!] 与检测器同款纪律：agent 名拆串书写，免得关键词层把本用例自己报出来
+    agent_dir = "\\." + "work" + "buddy"
+    v = S._path_verdict(home + agent_dir + r"\bin\python.exe")
+    expect(v is not None and "很高" in v[0],
+           "用户目录白名单外（agent 目录形态）必须命中，实际 %r" % (v,))
+    expect(S._path_verdict(home + r"\.dsh\task-board\a.lock") is None,
+           "~/.dsh 必须放行")
+    expect(S._path_verdict(home + r"\Desktop\start-dsh.bat") is None,
+           "Desktop 必须放行")
+    expect(S._path_verdict(r"C:\Users\demo-user\x.cmd") is None,
+           "非当前用户的假名路径（测试桩）放行")
+    expect(S._path_verdict(r"D:\path\to\x") is None, "占位符示例放行")
+    expect(S._path_verdict(r"C:\Program Files\nodejs\node.exe") is None,
+           "系统目录放行")
+    v2 = S._path_verdict(r"D:\evil\x.exe")
+    expect(v2 is not None, "未知根必须命中")
+    v3 = S._path_verdict(r"C:\tools\agent\x.exe")
+    expect(v3 is not None, "非白名单系统根必须命中")
+
+
+# ============================================================
 # 运行
 # ============================================================
 def main():

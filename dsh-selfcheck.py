@@ -9,11 +9,13 @@
   5. subprocess 参数名误用（flags= 应为 creationflags=）
   6. .bat 行尾（必须纯 CRLF）与关键加固点
   7. 危险调用（无备份保护的删除类操作）
-  8. 解耦检查（代码与入口 bat 都不得引用任何 AI agent / IDE 插件的目录）
+  8. 解耦检查（关键词黑名单 + **绝对路径白名单**：代码与入口 bat 里出现的
+     任何盘符路径字面量必须落在白名单根内 —— 用户目录白名单外（agent 目录
+     即此类）或未知根一律报「很高」，不依赖认识具体的 agent 名字）
 
 用法：python dsh-selfcheck.py
 """
-import os, ast, re, sys, glob, builtins
+import os, ast, re, sys, glob, tempfile, builtins
 
 # 终端是 chcp 936（GBK）时，打印非 GBK 字符会抛 UnicodeEncodeError。
 try:
@@ -37,6 +39,12 @@ PY_FILES = ["dsh_env.py", "dsh-launcher.py", "dsh-plugins.py",
 #     语法/未定义名等 AST 检查仍只跑 PY_FILES（临时脚本随写随删，不追求全检）。
 TEMP_PY_FILES = sorted(os.path.basename(x) for x in glob.glob(
     os.path.join(TOOLS, "_*.py")))
+# 解耦检查（关键词 + 绝对路径白名单）的扫描面：目录里全部 .py（除自身）——
+# 自动覆盖 PY_FILES、临时脚本、以及将来新增的任何工具，不再靠手工维护清单
+SCAN_ALL = sorted(
+    f for f in (set(PY_FILES) | set(TEMP_PY_FILES) |
+                {f for f in os.listdir(TOOLS) if f.endswith(".py")})
+    if f != "dsh-selfcheck.py")
 # 只检查真正的用户入口（桌面 bat）。
 # dsh-run.bat 是过去的计划任务测试入口，已于 2026-09-18 删除，不再纳入检查。
 BAT_FILES = [os.path.join(DESK, "start-dsh.bat")]
@@ -293,7 +301,7 @@ AGENT_PAT = re.compile(
 ENV_AGENT = re.compile(r"os\.environ\.get\(\s*['\"]"
                        r"(" + _A1.upper() + "|" + _A2.upper() + "|"
                        + _A3.upper() + ")[A-Z_]*['\"]", re.I)
-for f in PY_FILES + TEMP_PY_FILES:
+for f in SCAN_ALL:
     fp = os.path.join(TOOLS, f)
     if not os.path.exists(fp):
         continue
@@ -334,6 +342,98 @@ for bp in BAT_FILES:
         if AGENT_PAT.search(code):
             add("很高", os.path.basename(bp),
                 "行%d 引用 agent 目录（应完全解耦）：%s" % (i, l.strip()[:70]))
+
+# ---------- 8) 绝对路径白名单：把解耦从「黑名单枚举」升级为「结构约束」 ----------
+# 关键词黑名单只认识【已知的 agent 名字】—— 换个名字的依赖它一个都抓不到。
+# 白名单反之：任何盘符路径字面量必须落在允许的根内（自己的目录 / ~/.dsh /
+# Desktop / TEMP / 系统目录 / Program Files）；落在当前用户目录的其它位置
+# （.workbuddy 就是这个形态）或未知根（D:\、C:\tools 之类）一律「很高」。
+# 关键词层保留为第二层，抓没有路径形态的引用。
+HOME_DIR = os.path.expanduser("~")
+TEMP_DIR = tempfile.gettempdir()
+ALLOWED_ROOTS = [
+    TOOLS,
+    os.path.join(HOME_DIR, ".dsh"),
+    os.path.join(HOME_DIR, "Desktop"),
+    TEMP_DIR,
+    r"C:\WINDOWS",
+    r"C:\Program Files",
+    r"C:\Program Files (x86)",
+]
+FIXTURE_SEGMENTS = {"path", "to", "xxx", "my tools", "demo-user",
+                    "example", "your", "test", "..."}
+
+
+def _under(p, root):
+    p = p.rstrip("\\").lower()
+    root = root.rstrip("\\").lower()
+    return p == root or p.startswith(root + "\\")
+
+
+def _path_verdict(p):
+    """绝对路径字面量 → None=放行；(严重级, 原因)=违规。"""
+    if not p or not re.match(r"^[A-Za-z]:\\", p):
+        return None
+    segs = [s.lower() for s in p.split("\\") if s]
+    if any(s in FIXTURE_SEGMENTS or "<" in s or "*" in s for s in segs):
+        return None                       # 文档示例 / 测试夹具占位符
+    if _under(p, HOME_DIR):
+        for root in ALLOWED_ROOTS:
+            if _under(p, root):
+                return None
+        return ("很高", "用户目录下落在白名单之外（agent 目录即此类）：%s" % p)
+    if p.startswith("c:\\users\\"):
+        return None                       # 非当前用户 → 测试桩假名
+    for root in ALLOWED_ROOTS:
+        if _under(p, root):
+            return None
+    return ("很高", "绝对路径指向未知根（零硬编码路径纪律）：%s" % p)
+
+
+# [!] 只扫【生产文件】（PY_FILES 去掉测试文件）：测试桩里满屏假路径是本分，
+#     不是运行时依赖；关键词层继续覆盖测试文件。用 AST 取【解码后】的完整
+#     字符串字面量 —— 对源码原文跑正则会在空格处截断（C:\Program Files
+#     被砍成 C:\Program，误报且漏判）。
+ABS_PATH_RE = re.compile(r"[A-Za-z]:\\[^\"'\r\n]*")
+PROD_SCAN_FILES = [f for f in PY_FILES if f != "dsh_tests.py"]
+for f in PROD_SCAN_FILES:
+    fp = os.path.join(TOOLS, f)
+    if not os.path.exists(fp):
+        continue
+    try:
+        ptree = ast.parse(open(fp, encoding="utf-8").read())
+    except SyntaxError:
+        continue                          # 语法层检查已单独报过高
+    # 文档字符串（docstring）是示例与说明，不是运行时依赖 —— 路径扫描跳过
+    doc_ids = set()
+    for scope in ([ptree] + [n for n in ast.walk(ptree)
+                             if isinstance(n, (ast.FunctionDef,
+                                               ast.AsyncFunctionDef,
+                                               ast.ClassDef))]):
+        b = scope.body if hasattr(scope, "body") else scope
+        if b and isinstance(b[0], ast.Expr) \
+                and isinstance(b[0].value, ast.Constant) \
+                and isinstance(b[0].value.value, str):
+            doc_ids.add(id(b[0].value))
+    for node in ast.walk(ptree):
+        if not (isinstance(node, ast.Constant) and isinstance(node.value, str)):
+            continue
+        if id(node) in doc_ids:
+            continue
+        for m in ABS_PATH_RE.finditer(node.value):
+            v = _path_verdict(m.group(0).rstrip())
+            if v:
+                add(v[0], f, "行%d %s" % (node.lineno, v[1]))
+for bp in BAT_FILES:
+    if not os.path.exists(bp):
+        continue
+    btxt = open(bp, "rb").read().decode("gbk", "replace")
+    for i, l in enumerate(btxt.splitlines(), 1):
+        code = re.split(r"(?i)(?<![^\s])rem\s", l)[0]
+        for m in ABS_PATH_RE.finditer(code):
+            v = _path_verdict(m.group(0).rstrip())
+            if v:
+                add(v[0], os.path.basename(bp), "行%d %s" % (i, v[1]))
 
 
 order = {"很高": 0, "高": 1, "中": 2, "低": 3}

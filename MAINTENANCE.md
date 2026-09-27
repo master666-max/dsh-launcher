@@ -24,9 +24,9 @@
 | `dsh-launcher.py` | 编排 + 交互菜单：启动 dsh、调自愈、调插件工具。**只做编排，不含 dsh 内部知识** | import dsh_env |
 | `dsh-plugins.py` | 插件管理：列出 181 个入口、冲突检查、启用/禁用（写 profile 补丁） | import dsh_env |
 | `dsh-fallback-heal.py` | 补齐 `.dsh-module-fallback` 缺失 junction（可子进程或直跑） | import dsh_env |
-| `dsh_tests.py` | **回归测试 36 用例**（改完代码必跑） | import dsh_env、加载 dsh-launcher/plugins |
-| `dsh-selfcheck.py` | 静态自检：语法/缺失 import/未定义名/GBK 字符/subprocess 参数名/bat 行尾/解耦 | 无依赖 |
-| `dsh-accept.py` | **一键验收**：静态自检 + 36 回归用例 + bat 语法闸 + 解释器探测 + 行尾，一次跑齐 | 子进程调上面两个 |
+| `dsh_tests.py` | **回归测试 38 用例**（改完代码必跑） | import dsh_env、加载 dsh-launcher/plugins |
+| `dsh-selfcheck.py` | 静态自检：语法/缺失 import/未定义名/GBK 字符/subprocess 参数名/bat 行尾/解耦（关键词黑名单 + 绝对路径白名单） | 无依赖 |
+| `dsh-accept.py` | **一键验收**：静态自检 + 38 回归用例 + bat 语法闸 + 解释器探测 + 行尾，一次跑齐 | 子进程调上面两个 |
 | `dsh-mutate.py` | **变异测试**：故意改坏 16 处关键逻辑，验证用例真能抓到回归 | 在 tempfile 副本上跑 dsh_tests.py |
 | `dsh-env.py` | 命令行薄壳（`--dump` / `--refresh` / `--json`），实现都在 dsh_env.py | import dsh_env |
 | `start-dsh.bat` | **启动入口**（复制到桌面用）。薄壳：定位工具链目录 + PATH 钉扎 + 转交 `dsh-launcher.py` | 无 |
@@ -78,7 +78,7 @@ python dsh-accept.py        # 【推荐】一键跑齐下面三段 + 解释器�
 或者分步：
 ```
 python dsh-selfcheck.py     # 静态自检（0 问题才算完）
-python dsh_tests.py         # 36 用例回归（全过才算完）
+python dsh_tests.py         # 38 用例回归（全过才算完）
 python dsh-env.py --refresh # 强制重探（dsh 升级/换目录后）
 ```
 
@@ -217,8 +217,11 @@ cmd 在**从批处理文件调用**的场景下，只要 `for`/`if` 括号块里
 4. Windows `py -3` 启动器
 5. `PATH` 里的 `python`（自动排除 WindowsApps 商店桩）
 
-**自检已内置解耦检查**：`dsh-selfcheck.py` 每次都会扫描 6 个代码文件与入口 bat，
-一旦出现 `.workbuddy` / `codebuddy` / `zcode` / `aicoding` 之类的引用会直接报「很高」。
+**自检已内置解耦检查（双层）**：`dsh-selfcheck.py` 每次都会扫描目录内全部 .py（自动发现，不靠手工清单）与入口 bat：
+① 关键词黑名单 —— 出现 `.workbuddy` / `codebuddy` / `zcode` / `aicoding` 之类的引用直接报「很高」；
+② **绝对路径白名单** —— 生产代码与 bat 里的盘符路径字面量必须落在白名单根（自身目录 / ~/.dsh / Desktop / TEMP / 系统目录 / Program Files）内，
+   落在当前用户目录的其它位置（agent 目录就是这个形态）或未知根一律「很高」。黑名单只认识已知的 agent 名字，白名单才是结构约束；
+   docstring 示例与测试桩假路径不计。
 **换句话说：解耦不是一次性动作，而是每次自检都会复核的常驻约束。**
 
 > 若本工具需要迁移到别的机器/别的用户名：整个 `dsh-launcher` 文件夹拷过去即可，
@@ -264,6 +267,24 @@ cmd 在**从批处理文件调用**的场景下，只要 `for`/`if` 括号块里
 **判「整份文件」是否合法，必须用「全行 + 收尾片段」。**
 
 ## 七、变更记录
+
+### 2026-09-28　启动判定盲点补齐 + 解耦检查升级绝对路径白名单
+
+第一性原理复核（解耦=依赖轴问题、启动率=故障链问题）指出两个残余缺口，本节补齐：
+
+1. **`live_now` 判定盲点**：旧版只探配置端口 + 默认端口表 —— dsh 若绑在表外
+   端口（dsh-mobile 的 3443 那类），实际起来了却被判「失败」，会去拉第二个实例。
+   现在候选端口全落空时以 `dsh_running_any_port()`（node 全端口扫描，首中即返）
+   兜底；探不动时保守按「在跑」。
+2. **解耦检查从黑名单升级为双层**：关键词黑名单只认识已知的 agent 名字
+   （`.workbuddy` 漏网事件就是教训）；新增**绝对路径白名单** —— 生产代码与入口
+   bat 里的盘符路径字面量必须落在白名单根（自身目录 / ~/.dsh / Desktop / TEMP /
+   系统目录 / Program Files）内，用户目录白名单外（agent 目录就是这个形态）或
+   未知根一律「很高」。docstring 示例与测试桩假路径不计；扫描面自动化为
+   「目录内全部 .py」，不再靠手工清单。
+
+验证：新增 2 个守护用例（兜底判定、白名单判定器），回归 36 → 38 全绿，
+selfcheck 0 问题。白名单灵敏度经负例实测（agent 目录形态、未知根均命中）。
 
 ### 2026-09-26　入口 bat 不再硬编码安装位：TOOLS 三级解析（目录可随意搬动）
 
@@ -590,7 +611,7 @@ python dsh-accept.py        :: 一键跑齐：静态自检 + 36 回归用例 + b
 单独跑也可以：
 ```bat
 python dsh-selfcheck.py      :: 含解耦检查 + bat 行尾 + 块内跨行 if 检查
-python dsh_tests.py          :: 36 用例
+python dsh_tests.py          :: 38 用例
 ```
 
 ### 排「启动器秒退」的最小步骤

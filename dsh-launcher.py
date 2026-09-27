@@ -357,10 +357,13 @@ def _action_start_impl(assume_yes):
 
 
 def live_now(env=None):
-    """dsh 是否真的起来了（实际配置端口 + 全部候选端口探活）。
+    """dsh 是否真的起来了（配置端口 + 候选端口 + node 全端口兜底）。
 
     [!] 不能只看 DEFAULT_PORTS 前几个 —— 用户把端口配成 3000/8080 时
         会误判「没起来」而接着拉起第二个实例。
+    [!] 候选端口全落空时再扫所有 node.exe 监听端口兜底 —— dsh 若改绑
+        表外端口（dsh-mobile 的 3443 那类），不能被判成「启动失败」
+        而去拉第二个实例。扫描内部按签名判定，探不动时保守按「在跑」。
     """
     ports = []
     if env and env.get("port"):
@@ -369,7 +372,7 @@ def live_now(env=None):
     for p in dict.fromkeys(ports):
         if dsh_env.is_dsh_here(p):
             return True
-    return False
+    return dsh_env.dsh_running_any_port()
 
 
 def run_plugins(args=None):
