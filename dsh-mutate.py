@@ -88,6 +88,26 @@ MUTANTS = [
     ("[bat] DSH_TOOLS 显式覆盖被忽略", "start-dsh.bat",
      'if defined DSH_TOOLS if exist "%DSH_TOOLS%\\dsh-launcher.py" for %%I in ("%DSH_TOOLS%.") do set "TOOLS=%%~fI"',
      "rem MUTANT: env override removed"),
+    # ---- 2026-09-29 新增：安全模式的守护 ----
+    # 内置插件是安全模式的「安全司机」——把它也禁了，安全模式就不再是
+    # 最小可判断环境（真凶都被关了反而查不出是谁）。护栏用例断言 timer
+    # 绝不出现在安全补丁里。
+    ("[plugins] 安全模式把内置插件也禁掉", "dsh-plugins.py",
+     """        if r.get("builtin"):
+            continue""",
+     """        if False:
+            continue"""),
+    # 备份是还原的唯一凭据 —— 丢了还硬写就会把用户正式补丁毁掉。
+    # 护栏用例删掉备份后要求 restore 拒绝且现状不动。
+    ("[plugins] safemode_restore 备份丢失仍盲写", "dsh-plugins.py",
+     "        if not bak or not os.path.exists(bak):",
+     "        if False:"),
+    # 幂等分支必须校验文件体：手写启用犯病插件后再点 [6] 必须重生成，
+    # 否则「安全模式」承诺破产。变异成永不重生成（if True 走老幂等路径）。
+    # 护栏用例④：手写覆盖 → re-enter → restore 必须能删纯生成件。
+    ("[plugins] 安全模式幂等不校验手写件（regen 丢失）", "dsh-plugins.py",
+     "        if SM_MARK in body:",
+     "        if True:"),
 ]
 
 caught = missed = skipped = 0

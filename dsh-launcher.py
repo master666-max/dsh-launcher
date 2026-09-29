@@ -10,6 +10,8 @@ dsh 启动器（终端菜单）
   [3] 只检查插件冲突
   [4] 补齐模块链接
   [5] 环境探测报告
+  [6] 安全模式启动（禁用全部外部插件）
+  [7] 恢复正式模式（还原安全模式禁掉的插件）
   [0] 退出
 
 本文件**只做编排与交互**：所有 dsh 相关知识（仓库/profile/端口/命令/锁/进程）
@@ -226,10 +228,10 @@ def action_start(assume_yes=False):
         release_instance_lock()
 
 
-def _action_start_impl(assume_yes):
+def _action_start_impl(assume_yes, safe=False):
     env = probe()
     line("=")
-    log("  启动 dsh")
+    log("  启动 dsh" + ("（安全模式）" if safe else ""))
     line("=")
     log()
 
@@ -238,6 +240,23 @@ def _action_start_impl(assume_yes):
             log("  （--yes：自动确认）%s" % msg.strip())
             return True
         return ask(msg).strip().lower() == "y"
+
+    # ---- 安全模式状态提示：普通启动撞上安全模式状态时必须说清楚 ----
+    if not safe:
+        try:
+            P = _plugins_mod()
+            if P:
+                prof = (env or {}).get("profile") or {}
+                in_safe, meta = P.safemode_status(prof.get("patch_file"))
+                if in_safe:
+                    log("  [!] 当前处于【安全模式】（%s 进入，禁用 %s 个外部插件）。"
+                        % (meta.get("ts"), meta.get("disabled")))
+                    log("      继续将以安全模式启动；要恢复正式模式请用菜单 [7]。")
+                    if not confirm("      仍要继续启动吗？(y/N) > "):
+                        return
+                    log()
+        except Exception:
+            pass
 
     repo = (env or {}).get("repo") or {}
     rpath = repo.get("path")
@@ -351,6 +370,8 @@ def _action_start_impl(assume_yes):
     else:
         log("  所有候选命令都失败了，退出码 = %s" % rc)
         log("  建议：菜单 [5] 看环境探测报告；或检查 dsh 是否已安装依赖。")
+    if safe:
+        log("  （安全模式）外部插件已临时禁用；恢复正常请用菜单 [7] 恢复正式模式。")
     line("=")
     log()
     pause("  回车关闭窗口...")
@@ -382,6 +403,89 @@ def run_plugins(args=None):
         pause()
         return
     subprocess.call([sys.executable, p] + (args or []))
+
+
+def action_safe_start():
+    """安全模式启动：备份补丁 → 整份替换为「只禁外部插件」的生成补丁 → 启动。
+
+    类比 Windows 安全模式：某个外部插件把 dsh 搞挂时，仍能最小化进系统。
+    全程可逆（菜单 [7] 还原）；进入失败（拿不到权威树等）绝不半途启动。
+    """
+    if not acquire_instance_lock():
+        pause()
+        return
+    try:
+        line("=")
+        log("  安全模式启动 dsh")
+        line("=")
+        log()
+        P = _plugins_mod()
+        if not P:
+            log("  [X] 找不到 dsh-plugins.py，安全模式不可用。")
+            log()
+            pause()
+            return
+        # 已在安全模式也照走 enter（内部幂等）：若补丁被手写改过（不再含生成标记），
+        # 会重新生成全禁补丁 —— 每次点 [6] 出来的必须是最小集，不许带私货。
+        # 首次最坏要跑一次 --dump-config（约 30 秒，上限 240 秒）
+        log("  正在获取权威插件树并生成安全补丁（首次最坏约 4 分钟）...")
+        log()
+        try:
+            st = P.collect()
+        except Exception as e:
+            log("  [X] 收集插件树失败：%s" % e)
+            log()
+            pause()
+            return
+        ok, note = P.safemode_enter(st.get("patch"),
+                                    (st.get("profile") or {}).get("dir"),
+                                    st.get("rows"), st.get("source"))
+        log("  %s %s" % ("[OK]" if ok else "[X]", note))
+        log()
+        if not ok:
+            pause()
+            return
+        _action_start_impl(assume_yes=False, safe=True)
+    finally:
+        release_instance_lock()
+
+
+def action_restore():
+    """恢复正式模式：按安全模式状态文件把原补丁原样还原。"""
+    line("=")
+    log("  恢复正式模式（还原安全模式禁用的插件）")
+    line("=")
+    log()
+    P = _plugins_mod()
+    if not P:
+        log("  [X] 找不到 dsh-plugins.py。")
+        log()
+        pause()
+        return
+    env = probe()
+    prof = (env or {}).get("profile") or {}
+    in_safe, meta = P.safemode_status(prof.get("patch_file"))
+    if not in_safe:
+        log("  当前不在安全模式，无需还原。")
+        log()
+        pause()
+        return
+    log("  安全模式信息：进入于 %s，禁用了 %s 个外部插件。"
+        % (meta.get("ts"), meta.get("disabled")))
+    # dsh 在跑时建议先停：还原会立刻热重载回全部插件，
+    # 安全模式下正「犯病」的那个插件会当场复活
+    live = find_live_ports(env)
+    if live:
+        log("  [!] dsh 正在运行（端口 %s）。" % ", ".join(map(str, live)))
+        if ask("      先结束 dsh 再还原？（推荐，Y/n）> ").strip().lower() in ("", "y"):
+            kill_leftover(env)
+    ok, note = P.safemode_restore(prof.get("patch_file"), prof.get("dir"))
+    log("  %s %s" % ("[OK]" if ok else "[X]", note))
+    log()
+    if ok and ask("  要现在以正式模式启动 dsh 吗？(y/N) > ").strip().lower() == "y":
+        action_start()
+        return
+    pause()
 
 
 def action_check():
@@ -504,9 +608,61 @@ MENU = """
   [3] 只检查插件冲突
   [4] 补齐模块链接
   [5] 环境探测报告
+  [6] 安全模式启动 —— 只留内置插件（dsh 起不来时的救命模式）
+  [7] 恢复正式模式 —— 还原安全模式禁用的插件
 
   [0] 退出
 """
+
+_PLUGINS = None
+
+
+def _plugins_mod():
+    """importlib 加载 dsh-plugins.py（文件名带连字符），进程内缓存。
+
+    安全模式的补丁机械（备份/替换/还原）都在那边 —— 与 [2]/[3] 的
+    子进程方式不同，这里直接 import：共享 dsh_env 单例缓存，
+    collect() 不用重新探测，还能拿到结构化结果控制流程。
+    """
+    global _PLUGINS
+    if _PLUGINS is None:
+        p = os.path.join(TOOLS, "dsh-plugins.py")
+        if not os.path.exists(p):
+            return None
+        import importlib.util
+        spec = importlib.util.spec_from_file_location("dsh_plugins_lm", p)
+        m = importlib.util.module_from_spec(spec)
+        spec.loader.exec_module(m)
+        _PLUGINS = m
+    return _PLUGINS
+
+
+def _safe_badge():
+    """菜单角标：是否处于安全模式。
+
+    [!] 只做 glob + 读一个 JSON（毫秒级）—— 绝不能在这里 probe()
+        （冷探测最坏 90 秒+，会把菜单第一屏拖成死窗口）。
+    """
+    try:
+        import glob as _g
+        pdir = os.path.join(dsh_env.DSH_STATE, "profiles", "web")
+        if not os.path.isdir(pdir):
+            return ""
+        hits = [h for h in sorted(_g.glob(os.path.join(pdir, "cordis*.y*ml")))
+                if ".bak" not in os.path.basename(h)
+                and ".tmp" not in os.path.basename(h)]
+        if not hits:
+            return ""
+        P = _plugins_mod()
+        if not P:
+            return ""
+        in_safe, meta = P.safemode_status(hits[0])
+        if in_safe:
+            return ("\n  [!] 当前处于【安全模式】（%s 进入，禁用 %s 个外部插件）"
+                    " —— 恢复用 [7]\n" % (meta.get("ts"), meta.get("disabled")))
+    except Exception:
+        pass
+    return ""
 
 
 def main():
@@ -550,7 +706,7 @@ def _main_menu():
             os.system("cls")
         else:
             os.system("clear")
-        log(MENU)
+        log(MENU + _safe_badge())
         try:
             cmd = input("  选择 [1] > ").strip()
         except (EOFError, KeyboardInterrupt):
@@ -574,6 +730,11 @@ def _main_menu():
                 action_heal()
             elif low == "5":
                 action_env()
+            elif low == "6":
+                action_safe_start()
+                return 0
+            elif low == "7":
+                action_restore()
             else:
                 log("  无效输入：%s" % cmd)
                 time.sleep(1.2)

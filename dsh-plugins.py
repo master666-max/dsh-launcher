@@ -23,6 +23,9 @@ dsh 插件管理（终端界面）
     python dsh-plugins.py --check    # 只做冲突检查（有高危返回码 2）
     python dsh-plugins.py --list     # 只列清单
     python dsh-plugins.py --dump     # 显示数据源与统计
+    python dsh-plugins.py --safemode-status   # 安全模式状态
+    python dsh-plugins.py --safemode-enter    # 进入安全模式（禁用全部外部入口）
+    python dsh-plugins.py --safemode-restore  # 退出安全模式（还原原补丁）
 """
 import os, re, sys, json, time, glob, shutil, subprocess
 
@@ -488,6 +491,253 @@ def set_disabled(patch, eid, flag):
                   % (os.path.basename(bak), before_ids, after_ids))
 
 
+# ==================== 安全模式（2026-09-29） ====================
+# 类比 Windows 安全模式：临时禁用全部外部（非内置）插件入口，最小化启动。
+# 用途：某个外部插件把 dsh 搞挂（crash loop / loader 入口 apply 报错）时，
+#       仍能进系统排查，而不用手撕补丁。
+# 机制：整份【替换】profile 补丁为「仅含禁用块」的生成文件；原补丁先备份；
+#       状态记录在 <补丁>.safemode.json；恢复时按状态文件原样还原（字节级）。
+# 纪律：拿不到权威插件树（--dump-config）时拒绝进入 —— 入口 id ≠ 包名，
+#       照包名盲写只会静默空转，给人假安全；宁可拒绝。
+SM_MARK = "# 安全模式补丁（dsh-plugins.py 生成"
+_SM_ID_OK = re.compile(r"^[A-Za-z0-9@/_.\-]+$")
+
+
+def _sm_meta_path(patch):
+    return (patch + ".safemode.json") if patch else None
+
+
+def safemode_status(patch):
+    """→ (是否处于安全模式, 状态 dict)。patch 为 None 视为不在。"""
+    mp = _sm_meta_path(patch)
+    if not mp:
+        return False, None
+    meta = read_json(mp)
+    if isinstance(meta, dict) and meta.get("kind") == "safemode":
+        return True, meta
+    return False, None
+
+
+def build_safe_patch_text(ids, ts):
+    """生成安全补丁全文：只含禁用块。ids 保序（确定性：同树同文件）。"""
+    o = [SM_MARK + " %s）" % ts,
+         "# 本文件整份替换了原补丁；原文件已备份（见同名 .safemode.json 状态文件）。",
+         "# 恢复正式模式：python dsh-plugins.py --safemode-restore（或启动器菜单 [7]）。",
+         ""]
+    for eid in ids:
+        o.append("- id: %s" % eid)
+        o.append("  disabled: true")
+    return "\n".join(o) + "\n"
+
+
+def _atomic_write_bytes(patch, data):
+    """原子写字节（A1 同款：临时文件 + os.replace）。返回 (ok, err)。"""
+    tmp = "%s.tmp-safemode-%d-%d" % (patch, os.getpid(),
+                                     int(time.time() * 1000) % 100000)
+    try:
+        with open(tmp, "wb") as f:
+            f.write(data)
+        os.replace(tmp, patch)
+        return True, None
+    except Exception as e:
+        try:
+            if os.path.exists(tmp):
+                os.remove(tmp)
+        except OSError:
+            pass
+        return False, str(e)
+
+
+def _invalidate_dump_cache():
+    """让 dump 缓存失效（补丁变了，权威树必须重取）。"""
+    try:
+        meta = os.path.join(TOOLS, "dsh-dump.cache.txt.meta.json")
+        if os.path.exists(meta):
+            os.remove(meta)
+    except Exception:
+        pass
+
+
+def _sm_effective_patch(patch, prof_dir):
+    """profile 没有任何补丁文件时，安全模式按标准名新建一个。"""
+    if patch:
+        return patch
+    return os.path.join(prof_dir, "cordis.patch.yml") if prof_dir else None
+
+
+def safemode_enter(patch, prof_dir, rows, source):
+    """进入安全模式：备份现补丁 → 整份替换为禁用块。幂等；失败不留半态。
+
+    rows 必须来自权威树（source == "dump"）。返回 (ok, note)。
+    """
+    eff = _sm_effective_patch(patch, prof_dir)
+    if not eff:
+        return False, "定位不到 profile 补丁路径，无法进入安全模式"
+    already, _m = safemode_status(eff)
+    regen = False
+    if already:
+        try:
+            body = open(eff, encoding="utf-8", errors="replace").read()
+        except Exception:
+            body = ""
+        if SM_MARK in body:
+            return True, "已在安全模式中（未重复操作），直接启动即可"
+        # 已在安全模式，但补丁被手写改过（不再是生成件）→ 必须重新生成。
+        # 否则「安全模式」承诺破产：用户手写启用犯病插件后再点 [6]，
+        # dsh 会带着犯病插件启动（Windows 安全模式每次都是干净最小集）。
+        # 绝不重复备份：最初那次备份才是「原补丁」的真相（meta 不换主人）。
+        regen = True
+
+    # [!] 纪律闸：入口 id ≠ 包名，非权威树的 id 集合不可信
+    if source != "dump":
+        return False, ("拿不到权威插件树（--dump-config），拒绝进入安全模式："
+                       "入口 id ≠ 包名，盲写只会静默空转（假安全）。"
+                       "请先跑一次菜单 [5]（或正常启动一次 dsh）刷新权威树。")
+
+    seen, ids, bad = set(), [], []
+    for r in rows or []:
+        if r.get("builtin"):
+            continue                 # 内置组合包入口绝不动（安全模式的「安全司机」）
+        if r.get("state") == "禁用":
+            continue                 # 已经是关的，不必写
+        eid = r.get("id") or ""
+        if not _SM_ID_OK.match(eid):
+            bad.append(eid)
+            continue
+        if eid not in seen:
+            seen.add(eid)
+            ids.append(eid)
+    if bad:
+        return False, ("以下入口 id 含不安全字符（YAML 指示符/空白/控制符），"
+                       "拒绝写入：%s" % "、".join(map(repr, bad[:4])))
+
+    ts = time.strftime("%Y%m%d-%H%M%S")
+    if regen:
+        m = json.load(open(_sm_meta_path(eff), encoding="utf-8"))
+        had = bool(m.get("had_patch"))
+        bak = (os.path.join(os.path.dirname(eff), m["backup"])
+               if m.get("backup") else None)
+    else:
+        had = os.path.exists(eff)
+        bak = None
+        if had:
+            bak = "%s.bak-safemode-%s" % (eff, ts)
+            try:
+                shutil.copy2(eff, bak)   # 字节级复制，行尾/编码分毫不动
+            except Exception as e:
+                return False, "备份失败，已中止（不冒险动你的补丁）：%s" % e
+
+    ok, err = _atomic_write_bytes(eff, build_safe_patch_text(
+        ids, time.strftime("%Y-%m-%d %H:%M:%S")).encode("utf-8"))
+    if not ok:
+        return False, "写入失败（原文件未动）：%s" % err
+
+    meta = {"kind": "safemode", "ts": ts, "patch": os.path.basename(eff),
+            "backup": os.path.basename(bak) if bak else None,
+            "had_patch": had, "disabled": len(ids)}
+    try:
+        with open(_sm_meta_path(eff), "w", encoding="utf-8") as f:
+            json.dump(meta, f, ensure_ascii=False, indent=2)
+    except Exception as e:
+        # 状态文件写失败 = 替换无主 → 立即回滚，绝不留「回不去」的状态
+        if had and bak:
+            try:
+                shutil.copy2(bak, eff)
+            except Exception:
+                pass
+        return False, "状态文件写失败，已回滚原补丁：%s" % e
+    _invalidate_dump_cache()
+    if regen:
+        return True, ("检测到安全补丁被手写改动，已重新生成：禁用 %d 个外部入口。"
+                      "备份仍是最初那份，菜单 [7] 恢复不受影响。" % len(ids))
+    return True, ("安全模式已启用：禁用 %d 个外部入口；原补丁%s。"
+                  "启动 dsh 即为最小插件集。"
+                  % (len(ids),
+                     ("已备份 → " + os.path.basename(bak)) if bak
+                     else "原本不存在（恢复时将删除本生成文件）"))
+
+
+def safemode_restore(patch, prof_dir):
+    """退出安全模式：按状态文件把原补丁原样还原。缺备份即拒绝（fail-closed）。"""
+    eff = _sm_effective_patch(patch, prof_dir)
+    if not eff:
+        return False, "定位不到 profile 补丁路径"
+    in_safe, meta = safemode_status(eff)
+    if not in_safe:
+        return False, "当前不在安全模式（找不到状态文件），无需还原"
+
+    had = bool(meta.get("had_patch"))
+    bak = os.path.join(os.path.dirname(eff), meta["backup"]) \
+        if meta.get("backup") else None
+    if had:
+        # [!] 备份丢了绝不能「拿生成文件凑合」—— 正式补丁只有那一份
+        if not bak or not os.path.exists(bak):
+            return False, ("备份文件丢失（%s），拒绝盲动。请人工检查补丁：%s"
+                           % (meta.get("backup"), eff))
+        try:
+            with open(bak, "rb") as f:
+                data = f.read()
+        except Exception as e:
+            return False, "备份读不出（拒绝盲动）：%s" % e
+        ok, err = _atomic_write_bytes(eff, data)
+        if not ok:
+            return False, "还原写入失败（现状未动）：%s" % err
+        try:
+            os.remove(bak)
+        except OSError:
+            pass
+        note = "已还原原补丁（%d 字节，与备份字节一致）" % len(data)
+    else:
+        # 进入前没有补丁文件：还原 = 删除生成文件。
+        # 但若现文件已不是我们生成的（用户手写过），绝不删 —— 宁可交还人工。
+        cur = read_text(eff) if os.path.exists(eff) else ""
+        if cur.strip() and SM_MARK not in cur:
+            return False, ("当前补丁不是安全模式生成的文件（可能被手写改过），"
+                           "拒绝删除，请人工确认：%s" % eff)
+        if os.path.exists(eff):
+            try:
+                os.remove(eff)
+            except Exception as e:
+                return False, "删除生成补丁失败：%s" % e
+        note = "已删除安全模式生成的补丁（进入前不存在补丁文件）"
+    try:
+        os.remove(_sm_meta_path(eff))
+    except OSError:
+        pass
+    _invalidate_dump_cache()
+    return True, note + "；重启 dsh 完全回到正式模式（patchReload=live 时即刻热生效）"
+
+
+def _safemode_cli(argv):
+    """--safemode-status / --safemode-enter / --safemode-restore 子命令。"""
+    env = ENV.detect() if ENV else None
+    prof = (env or {}).get("profile") or {}
+    patch, pdir = prof.get("patch_file"), prof.get("dir")
+
+    if "--safemode-status" in argv:
+        in_safe, meta = safemode_status(patch)
+        if in_safe:
+            log("安全模式: 开（%s 进入，禁用 %s 个外部入口，备份 %s）"
+                % (meta.get("ts"), meta.get("disabled"), meta.get("backup")))
+        else:
+            log("安全模式: 关")
+        return 0
+
+    if "--safemode-enter" in argv:
+        st = collect()
+        ok, note = safemode_enter(st.get("patch"),
+                                  (st.get("profile") or {}).get("dir"),
+                                  st.get("rows"), st.get("source"))
+        log(("[OK] " if ok else "[X] ") + note)
+        return 0 if ok else 1
+
+    if "--safemode-restore" in argv:
+        ok, note = safemode_restore(patch, pdir)
+        log(("[OK] " if ok else "[X] ") + note)
+        return 0 if ok else 1
+    return 1
+
+
 def run_heal():
     heal = os.path.join(TOOLS, "dsh-fallback-heal.py")
     if not os.path.exists(heal):
@@ -589,6 +839,9 @@ def main():
     check_only = "--check" in argv
     list_only = "--list" in argv
     dump_info = "--dump" in argv
+
+    if any(a.startswith("--safemode-") for a in argv):
+        return _safemode_cli(argv)
 
     try:
         st = collect()

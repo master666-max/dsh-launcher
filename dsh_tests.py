@@ -1185,6 +1185,139 @@ def t_path_verdict():
 
 
 # ============================================================
+# 10. 安全模式（2026-09-29）
+# ============================================================
+SM_ROWS = [
+    {"id": "timer", "builtin": True, "state": "启用"},                # 内置 → 不动
+    {"id": "dsh-better-sidebar", "builtin": False, "state": "启用"},  # 要禁
+    {"id": "logic-tree", "builtin": False, "state": "启用"},          # 要禁
+    {"id": "tool-fs", "builtin": False, "state": "禁用"},             # 已禁 → 不写
+    {"id": "mobile-access", "builtin": False, "state": "条件"},       # 条件 → 也要禁
+]
+
+
+@case("安全模式：enter/restore 全链路（字节级还原 / 幂等 / 内置不碰 / 条件也禁）")
+def t_safemode_roundtrip():
+    tmp = tempfile.mkdtemp(prefix="dsh_t_sm_")
+    try:
+        p = _copy_patch(tmp)
+        orig = open(p, "rb").read()
+        ok, note = dsh_plugins.safemode_enter(p, tmp, SM_ROWS, "dump")
+        expect(ok, "进入应成功：%s" % note)
+        t = open(p, encoding="utf-8").read()
+        expect("- id: dsh-better-sidebar" in t and "disabled: true" in t,
+               "外部启用入口应被禁用")
+        expect("- id: mobile-access" in t, "条件入口（!js）也必须禁用")
+        expect("- id: timer" not in t, "内置入口绝不能写进安全补丁")
+        expect("- id: tool-fs" not in t, "已禁用入口不必重写")
+        expect(dsh_plugins.SM_MARK in t, "须含状态标记（restore 的护栏判据）")
+        baks = [x for x in os.listdir(tmp) if ".bak-safemode-" in x]
+        expect(len(baks) == 1, "应恰好 1 份备份，实际 %r" % (baks,))
+        expect(os.path.exists(p + ".safemode.json"), "状态文件应存在")
+
+        # 幂等：再进一次 = no-op，且绝不能再产生第二份备份（防覆盖真原版）
+        ok2, note2 = dsh_plugins.safemode_enter(p, tmp, SM_ROWS, "dump")
+        expect(ok2 and "已在安全模式" in note2, "重复进入应幂等：%s" % note2)
+        expect(len([x for x in os.listdir(tmp) if ".bak-safemode-" in x]) == 1,
+               "幂等不得再备份")
+
+        # 还原：必须字节级还原 + 状态文件删除
+        ok3, note3 = dsh_plugins.safemode_restore(p, tmp)
+        expect(ok3, "还原应成功：%s" % note3)
+        expect(open(p, "rb").read() == orig, "必须字节级还原（差一个字节都不行）")
+        expect(not os.path.exists(p + ".safemode.json"), "状态文件应删除")
+        # 不在安全模式时 restore → 拒绝
+        ok4, _ = dsh_plugins.safemode_restore(p, tmp)
+        expect(ok4 is False, "不在安全模式时还原应拒绝")
+    finally:
+        shutil.rmtree(tmp, ignore_errors=True)
+
+
+@case("安全模式：护栏（非 dump 拒绝 / 不安全 id 拒绝 / 备份丢失拒绝 / 手写件不删）")
+def t_safemode_guards():
+    tmp = tempfile.mkdtemp(prefix="dsh_t_smg_")
+    try:
+        p = _copy_patch(tmp)
+        before = open(p, "rb").read()
+
+        # ① 非 dump 来源 → 拒绝（入口 id ≠ 包名，盲写 = 假安全）
+        ok, note = dsh_plugins.safemode_enter(p, tmp, SM_ROWS, "yaml")
+        expect(ok is False, "非权威树必须拒绝")
+        expect("权威" in note, "拒绝说明要讲清原因：%s" % note)
+        expect(open(p, "rb").read() == before, "拒绝后文件必须原封不动")
+        expect(not os.path.exists(p + ".safemode.json"), "拒绝后不得留状态文件")
+
+        # ② 含不安全字符的 id → 拒绝且不写
+        bad_rows = [{"id": "bad id", "builtin": False, "state": "启用"}]
+        ok, note = dsh_plugins.safemode_enter(p, tmp, bad_rows, "dump")
+        expect(ok is False and "不安全" in note, "不安全 id 应拒绝：%s" % note)
+        expect(open(p, "rb").read() == before, "拒绝后文件必须原封不动")
+
+        # ③ 备份丢失 → restore 拒绝（fail-closed，不能拿生成文件凑合）
+        ok, _ = dsh_plugins.safemode_enter(p, tmp, SM_ROWS, "dump")
+        expect(ok, "进入应成功")
+        bak = [x for x in os.listdir(tmp) if ".bak-safemode-" in x][0]
+        os.remove(os.path.join(tmp, bak))
+        safe_body = open(p, "rb").read()
+        ok, note = dsh_plugins.safemode_restore(p, tmp)
+        # 断言「丢失」而非泛「备份」：显式存在性检查说「文件丢失」；若该层被
+        # 变异掉，兜底 except 只会说「备份读不出」——诊断词不同，测试才抓得到。
+        expect(ok is False and "丢失" in note,
+               "备份丢失应拒绝还原（诊断须是『丢失』）：%s" % note)
+        expect(open(p, "rb").read() == safe_body, "拒绝还原时现状不能动")
+    finally:
+        shutil.rmtree(tmp, ignore_errors=True)
+
+    # ④ 进入前不存在补丁：生成 → 还原删除；但被手写改过的生成件拒绝删
+    tmp2 = tempfile.mkdtemp(prefix="dsh_t_smg2_")
+    try:
+        p2 = os.path.join(tmp2, "cordis.patch.yml")
+        expect(not os.path.exists(p2), "前置：文件不存在")
+        ok, note = dsh_plugins.safemode_enter(p2, tmp2, SM_ROWS, "dump")
+        expect(ok, "无原补丁也应能进入（had_patch=False）：%s" % note)
+        expect(os.path.exists(p2) and dsh_plugins.SM_MARK in open(p2, encoding="utf-8").read(),
+               "应生成安全补丁")
+        # 手写改掉生成件 → 还原必须拒绝删除
+        open(p2, "w", encoding="utf-8").write("- id: my-own\n  disabled: false\n")
+        ok, note = dsh_plugins.safemode_restore(p2, tmp2)
+        expect(ok is False and "拒绝" in note, "手写件必须拒绝自动删除：%s" % note)
+        expect("- id: my-own" in open(p2, encoding="utf-8").read(), "手写内容必须保留")
+        # 恢复成纯生成件 → 还原应删除文件与状态
+        ok, _ = dsh_plugins.safemode_enter(p2, tmp2, SM_ROWS, "dump")
+        expect(ok, "重新进入应成功")
+        ok, note = dsh_plugins.safemode_restore(p2, tmp2)
+        expect(ok, "纯生成件应可自动删除：%s" % note)
+        expect(not os.path.exists(p2), "生成件应被删除")
+        expect(not os.path.exists(p2 + ".safemode.json"), "状态文件应删除")
+    finally:
+        shutil.rmtree(tmp2, ignore_errors=True)
+
+
+@case("安全模式：菜单角标（glob+状态文件，毫秒级、绝不触发全量探测）")
+def t_safemode_badge():
+    L = _load_launcher('dsh_launcher_badge')
+    d = tempfile.mkdtemp(prefix="dsh_t_smb_")
+    real_state = dsh_env.DSH_STATE
+    try:
+        pdir = os.path.join(d, "profiles", "web")
+        os.makedirs(pdir)
+        p = os.path.join(pdir, "cordis.patch.yml")
+        open(p, "w", encoding="utf-8").write("# x\n")
+        dsh_env.DSH_STATE = d
+        expect(L._safe_badge() == "", "无状态文件 → 无角标")
+        meta = {"kind": "safemode", "ts": "20260929-120000",
+                "patch": "cordis.patch.yml", "backup": "x.bak-safemode-y",
+                "had_patch": True, "disabled": 7}
+        open(p + ".safemode.json", "w", encoding="utf-8").write(json.dumps(meta))
+        badge = L._safe_badge()
+        expect("安全模式" in badge and "[7]" in badge,
+               "应显示角标与恢复入口，实际 %r" % (badge,))
+    finally:
+        dsh_env.DSH_STATE = real_state
+        shutil.rmtree(d, ignore_errors=True)
+
+
+# ============================================================
 # 运行
 # ============================================================
 def main():
