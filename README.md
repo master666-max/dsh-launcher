@@ -45,12 +45,17 @@ git clone https://github.com/master666-max/dsh-launcher.git "%USERPROFILE%\dsh-l
 [5] 环境探测报告
 [6] 安全模式启动（禁用全部外部插件）
 [7] 恢复正式模式（还原安全模式禁掉的插件）
+[8] 重启 dsh（结束现有实例再启动）
 [0] 退出
 ```
 
 > [6]/[7] 类比 Windows 安全模式：某个外部插件把 dsh 搞挂时，[6] 仍能以最小插件集进系统排查。
 > 进入前必须拿到权威插件树（入口 id ≠ 包名，拿不到就拒绝，绝不假安全）；
 > 原补丁字节级备份，[7] 一键原样还原，全程可逆。
+
+> **dsh 在后台运行**（2026-09-30 起）：[1]/[6]/[8] 拉起 dsh 后本终端回到菜单，
+> dsh 的输出落 `~/.dsh/logs/dsh-bg-*.log`（保留最近 10 份）—— 报错先看它。
+> 停止/重启 dsh：菜单 [8] 或桌面 结束-dsh.bat。
 
 ## 文件说明
 
@@ -60,10 +65,10 @@ git clone https://github.com/master666-max/dsh-launcher.git "%USERPROFILE%\dsh-l
 | `dsh-launcher.py` | 编排 + 交互菜单。**不含任何 dsh 内部知识** |
 | `dsh-plugins.py` | 插件管理：列出全部入口、冲突检查、启用/禁用（写 profile 补丁） |
 | `dsh-fallback-heal.py` | 补齐 `.dsh-module-fallback` 缺失 junction |
-| `dsh_tests.py` | **回归测试（41 用例）**，写操作全在临时副本上 |
+| `dsh_tests.py` | **回归测试（43 用例）**，写操作全在临时副本上 |
 | `dsh-selfcheck.py` | 静态自检：语法 / 缺失 import / 未定义名 / GBK 字符 / subprocess 参数名 / bat 行尾 / 解耦（关键词黑名单 + **绝对路径白名单**） |
-| `dsh-accept.py` | **一键验收**：静态自检 + 41 回归用例 + bat 语法闸 + 解释器探测 + 行尾检查 |
-| `dsh-mutate.py` | **变异测试**：故意改坏 19 处关键逻辑，验证回归用例真能抓到 |
+| `dsh-accept.py` | **一键验收**：静态自检 + 43 回归用例 + bat 语法闸 + 解释器探测 + 行尾检查 |
+| `dsh-mutate.py` | **变异测试**：故意改坏 21 处关键逻辑，验证回归用例真能抓到 |
 | `dsh-env.py` | 命令行薄壳（`--dump` / `--refresh` / `--json`） |
 | `start-dsh.bat` | **启动入口**（复制到桌面用）。薄壳：定位工具链目录 + PATH 钉扎 + 转交 `dsh-launcher.py` |
 | `结束-dsh.bat` | **停止脚本**（复制到桌面用）。netstat+taskkill 结束占用 3080 的进程 |
@@ -77,7 +82,7 @@ python dsh-accept.py         :: 【推荐】一键跑齐下面三段 + 解释器
 分步跑也可以：
 ```bat
 python dsh-selfcheck.py      :: 静态自检，0 问题才算完
-python dsh_tests.py          :: 41 用例回归，全过才算完
+python dsh_tests.py          :: 43 用例回归，全过才算完
 python dsh-env.py --refresh  :: dsh 升级或换目录后强制重探
 ```
 

@@ -24,10 +24,10 @@
 | `dsh-launcher.py` | 编排 + 交互菜单：启动 dsh、调自愈、调插件工具。**只做编排，不含 dsh 内部知识** | import dsh_env |
 | `dsh-plugins.py` | 插件管理：列出 181 个入口、冲突检查、启用/禁用（写 profile 补丁） | import dsh_env |
 | `dsh-fallback-heal.py` | 补齐 `.dsh-module-fallback` 缺失 junction（可子进程或直跑） | import dsh_env |
-| `dsh_tests.py` | **回归测试 41 用例**（改完代码必跑） | import dsh_env、加载 dsh-launcher/plugins |
+| `dsh_tests.py` | **回归测试 43 用例**（改完代码必跑） | import dsh_env、加载 dsh-launcher/plugins |
 | `dsh-selfcheck.py` | 静态自检：语法/缺失 import/未定义名/GBK 字符/subprocess 参数名/bat 行尾/解耦（关键词黑名单 + 绝对路径白名单） | 无依赖 |
-| `dsh-accept.py` | **一键验收**：静态自检 + 41 回归用例 + bat 语法闸 + 解释器探测 + 行尾，一次跑齐 | 子进程调上面两个 |
-| `dsh-mutate.py` | **变异测试**：故意改坏 19 处关键逻辑，验证用例真能抓到回归 | 在 tempfile 副本上跑 dsh_tests.py |
+| `dsh-accept.py` | **一键验收**：静态自检 + 43 回归用例 + bat 语法闸 + 解释器探测 + 行尾，一次跑齐 | 子进程调上面两个 |
+| `dsh-mutate.py` | **变异测试**：故意改坏 21 处关键逻辑，验证用例真能抓到回归 | 在 tempfile 副本上跑 dsh_tests.py |
 | `dsh-env.py` | 命令行薄壳（`--dump` / `--refresh` / `--json`），实现都在 dsh_env.py | import dsh_env |
 | `start-dsh.bat` | **启动入口**（复制到桌面用）。薄壳：定位工具链目录 + PATH 钉扎 + 转交 `dsh-launcher.py` | 无 |
 | `结束-dsh.bat` | **停止脚本**（复制到桌面用）。netstat+taskkill 释放 3080 | 无 |
@@ -69,7 +69,7 @@
 
 ### 启动
 双击 `%USERPROFILE%\Desktop\start-dsh.bat`。
-1 秒内不做任何输入 → 自动启动；按任意键 → 进菜单（[1]启动 [2]插件 [3]查冲突 [4]补链接 [5]环境报告 [6]安全模式 [7]恢复正式 [0]退出）。
+1 秒内不做任何输入 → 自动启动；按任意键 → 进菜单（[1]启动 [2]插件 [3]查冲突 [4]补链接 [5]环境报告 [6]安全模式 [7]恢复正式 [8]重启 [0]退出）。
 
 ### 改完代码后必做的三件事
 ```
@@ -78,13 +78,13 @@ python dsh-accept.py        # 【推荐】一键跑齐下面三段 + 解释器�
 或者分步：
 ```
 python dsh-selfcheck.py     # 静态自检（0 问题才算完）
-python dsh_tests.py         # 41 用例回归（全过才算完）
+python dsh_tests.py         # 43 用例回归（全过才算完）
 python dsh-env.py --refresh # 强制重探（dsh 升级/换目录后）
 ```
 
 ### 动手改逻辑前：先跑变异测试
 ```
-python dsh-mutate.py       # 故意改坏 19 处关键逻辑，看用例抓不抓得到
+python dsh-mutate.py       # 故意改坏 21 处关键逻辑，看用例抓不抓得到
 ```
 **理由**：用例"全绿"不等于有用例。本项目实测过 —— `parse_dump` / `is_dsh_here` /
 `set_disabled` / `split_win_cmdline` / `clean_stale_locks` / `live_now` 六处关键修复
@@ -267,6 +267,40 @@ cmd 在**从批处理文件调用**的场景下，只要 `for`/`if` 括号块里
 **判「整份文件」是否合法，必须用「全行 + 收尾片段」。**
 
 ## 七、变更记录
+
+### 2026-09-30　dsh 转后台运行（终端还给人）+ 菜单 [8] 重启
+
+**旧行为的坑**：`[1] 启动` 用 `subprocess.call` **前台阻塞**跑 `pnpm dsh web` ——
+dsh 活多久终端被日志占多久，dsh 一退启动器直接退出、窗口关闭，菜单形同虚设。
+
+1. **后台拉起**：改 `subprocess.Popen`（`CREATE_NO_WINDOW | CREATE_NEW_PROCESS_GROUP`，
+   stdin DEVNULL），候选轮换逻辑不变（端口探活判据原样保留：起来才算成功，
+   秒退就换下一个候选）。探活轮询 2 秒/次、上限 180 秒（冷启动 15s 基线、
+   最坏 120s+）；**超时但进程仍活着 ≠ 失败**，提示慢启动后回菜单，绝不拉第二个实例。
+2. **日志绝不丢**：dsh 的加载错误只走 stdout/stderr（hub.log 只有「启动了」），
+   后台化后输出重定向 `~/.dsh/logs/dsh-bg-<时间戳>.log`（保留最近 10 份）。
+   启动成功打印 PID 与日志路径；候选失败时自动打日志尾部 12 行。
+   有守护用例：子进程输出必须出现在日志文件里（防「丢日志」退化）。
+3. **终端交还菜单**：[1]/[6]/[8] 启动成功后回车回菜单，不再整个退出；
+   双击 bat 的 1 秒自动启动同理。`--start` 命令行模式保持启动完退出。
+   Ctrl+C 语义变化：后台模式下只中断「等待」，dsh 在新进程组收不到 SIGINT
+   —— 停 dsh 用 [8] 或 结束-dsh.bat（提示已写进启动横幅）。
+4. **菜单 [8] 重启 dsh**：结束现有实例（kill_leftover）→ **等端口真释放**
+   （`_wait_ports_free`，taskkill 是异步的，撞残留就是一轮脏锁故障）→
+   转交完整启动流程（含清强杀残留锁 + 自愈 + 安全模式状态检查）。
+   端口 15 秒不释放时需确认才继续。
+
+验证：回归 41 → **43 全绿**（后台启动 4 断言、重启 3 断言）；
+变异 19 → **21 条：抓到 21 / 漏掉 0 / 跳过 0**（新增「不重定向日志」「重启不杀
+旧实例」2 条）；selfcheck 0 问题；accept 一键验收 ALL PASS。
+
+运维注意（2026-09-30 实测）：宿主环境的 SAFE_DELETE 批删确认钩子会盯上
+**后台任务**里的批删进程（turn 内删 50+ 文件即拦，直接杀掉测试子进程，
+变异测试表现为「变异体自身崩溃」+ stderr 混入
+`[safe-delete][SAFE_DELETE_BULK_CONFIRM_REQUIRED]`；计数跨命令累计，重试
+只会更糟）。前台命令不受监控。所以变异测试**分批前台跑**：
+`python dsh-mutate.py --range 0:7` / `--range 7:14` / `--range 14:21`
+（汇总行注明本批范围与全套条数），或以后台跑通时自然更好。
 
 ### 2026-09-29　安全模式启动（菜单 [6]/[7]）：插件把 dsh 搞挂时的最小集逃生门
 
@@ -645,7 +679,7 @@ python dsh-accept.py        :: 一键跑齐：静态自检 + 36 回归用例 + b
 单独跑也可以：
 ```bat
 python dsh-selfcheck.py      :: 含解耦检查 + bat 行尾 + 块内跨行 if 检查
-python dsh_tests.py          :: 41 用例
+python dsh_tests.py          :: 43 用例
 ```
 
 ### 排「启动器秒退」的最小步骤

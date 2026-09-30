@@ -27,6 +27,11 @@ import dsh_env                       # 探测层（单例）
 
 AUTO_START_SECONDS = 1.0
 FLAGS = getattr(subprocess, "CREATE_NO_WINDOW", 0)
+# 后台启动 dsh：无窗口 + 新进程组（Ctrl+C 只打断启动器，不会顺手杀掉 dsh）
+BG_FLAGS = FLAGS | getattr(subprocess, "CREATE_NEW_PROCESS_GROUP", 0)
+BG_WAIT_MAX = 180        # 后台启动等端口探活的上限（秒；冷启动 15s 基线，最坏 120s+）
+BG_POLL = 2              # 探活轮询间隔（秒）
+BG_LOG_KEEP = 10         # 后台日志保留份数（多了删最旧）
 
 try:
     sys.stdout.reconfigure(errors="replace")
@@ -313,12 +318,15 @@ def _action_start_impl(assume_yes, safe=False):
     else:
         log("  [1/2] 跳过模块链接检查（该机制在当前 dsh 版本中不存在）")
 
-    # ---- 第 2 步：按候选顺序尝试启动 ----
-    log("  [2/2] 拉起 dsh")
+    # ---- 第 2 步：按候选顺序尝试启动（后台 + 端口探活）----
+    log("  [2/2] 拉起 dsh（后台运行，日志落盘）")
     log()
     line("-")
-    log("  提示：浏览器里若提示 authentication required，")
-    log("        把下面那行 dsh web: 的完整地址（含 ?token=）复制过去即可。")
+    log("  提示：dsh 将在后台运行，本终端稍后回到菜单。")
+    log("        日志在 ~/.dsh/logs/dsh-bg-*.log（报错先看它）")
+    log("        停止 dsh：菜单 [8] 重启，或桌面 结束-dsh.bat")
+    log("        浏览器若提示 authentication required，")
+    log("        把日志里那行 dsh web: 的完整地址（含 ?token=）复制过去即可。")
     line("-")
     log()
 
@@ -327,18 +335,22 @@ def _action_start_impl(assume_yes, safe=False):
     rc = None
     interrupted = False
     was_live = False
+    timed_out = False
+    bg_logpath = None
+    bg_proc = None
     for i, c in enumerate(cmds, 1):
         log("  尝试 %d/%d：%s" % (i, len(cmds), c["label"]))
         t0 = time.time()
         try:
-            # cmdline（字符串命令行）优先：cmd /s /c 的整体外引号只有用
-            # 字符串直传才不会被 list2cmdline 转义坏
-            rc = subprocess.call(c.get("cmdline") or c["argv"],
-                                 cwd=rpath, env=penv)
+            status, rc, bg_logpath, bg_proc = _spawn_bg_and_wait(
+                c, rpath, penv, env)
         except KeyboardInterrupt:
+            # [!] 后台模式下 Ctrl+C 只打断「等待」—— dsh 在新进程组里
+            #     收不到控制台的 SIGINT，若已起来就让它继续跑
             log()
-            log("  已中断。")
-            rc, interrupted = -1, True
+            log("  已停止等待（dsh 若已在后台运行，不受影响）。")
+            log("  要停 dsh：菜单 [8] 重启，或桌面 结束-dsh.bat。")
+            interrupted = True
             break
         except OSError as e:
             log("  [!] 无法执行该候选：%s" % e)
@@ -347,26 +359,40 @@ def _action_start_impl(assume_yes, safe=False):
         dt = time.time() - t0
         # 判据：【端口探活】而不是运行时长 ——
         #   起来了才算成功；崩得再晚也要换下一个候选
-        if live_now(env):
+        if status == "bg":
             chosen = c["label"]
             was_live = True
             break
+        if status == "timeout":
+            chosen = c["label"]
+            timed_out = True
+            break
+        # status == "exit"：进程自己退出了
         if rc == 0:
             chosen = c["label"]
             break
-        log("  [!] 该命令 %.1f 秒就退出（退出码 %s），换下一个候选..." % (dt, rc))
+        log("  [!] 该命令 %.1f 秒就退出（退出码 %s），日志尾部：" % (dt, rc))
+        _log_tail(bg_logpath)
+        log("  换下一个候选...")
         log()
 
     log()
     line("=")
     if interrupted:
-        log("  已中断（dsh 未启动或已停止）")
+        log("  已停止等待（dsh 可能仍在后台；看日志 %s）"
+            % (bg_logpath or "~/.dsh/logs/"))
+    elif chosen and was_live:
+        log("  dsh 已在后台运行    使用的命令：%s" % chosen)
+        if bg_proc is not None and bg_proc.pid:
+            log("  进程 PID：%s（树根，结束用菜单 [8] 或 结束-dsh.bat）" % bg_proc.pid)
+        log("  日志：%s" % bg_logpath)
+        log("  本终端已交还菜单 —— 停止 dsh 用菜单 [8] 或桌面 结束-dsh.bat。")
+    elif chosen and timed_out:
+        log("  等了 %d 秒还没探到端口，但进程仍在（可能正在慢启动）。" % BG_WAIT_MAX)
+        log("  日志：%s" % bg_logpath)
+        log("  稍后可用浏览器直接访问；要重来一次用菜单 [8] 重启。")
     elif chosen:
-        if was_live:
-            log("  dsh 已在后台运行    使用的命令：%s（启动器退出码 %s）"
-                % (chosen, rc))
-        else:
-            log("  dsh 已退出    使用的命令：%s    退出码 = %s" % (chosen, rc))
+        log("  dsh 已退出    使用的命令：%s    退出码 = %s" % (chosen, rc))
     else:
         log("  所有候选命令都失败了，退出码 = %s" % rc)
         log("  建议：菜单 [5] 看环境探测报告；或检查 dsh 是否已安装依赖。")
@@ -374,7 +400,7 @@ def _action_start_impl(assume_yes, safe=False):
         log("  （安全模式）外部插件已临时禁用；恢复正常请用菜单 [7] 恢复正式模式。")
     line("=")
     log()
-    pause("  回车关闭窗口...")
+    pause("  回车返回菜单...")
 
 
 def live_now(env=None):
@@ -394,6 +420,122 @@ def live_now(env=None):
         if dsh_env.is_dsh_here(p):
             return True
     return dsh_env.dsh_running_any_port()
+
+
+def _bg_logfile():
+    """开一个后台启动日志：~/.dsh/logs/dsh-bg-<时间戳>.log，返回 (路径, 句柄)。
+
+    [!] dsh 的加载错误只走 stdout/stderr（hub.log 只有「启动了」三件套），
+        所以 dsh 转后台后输出必须落文件 —— 丢日志 = 层5 故障瞎掉。
+        旧日志按份数轮转（BG_LOG_KEEP）。
+    """
+    d = os.path.join(dsh_env.DSH_STATE, "logs")
+    try:
+        os.makedirs(d, exist_ok=True)
+    except Exception:
+        d = tempfile.gettempdir()
+    ts = time.strftime("%Y%m%d-%H%M%S")
+    path = os.path.join(d, "dsh-bg-%s.log" % ts)
+    try:
+        olds = sorted(f for f in os.listdir(d)
+                      if f.startswith("dsh-bg-") and f.endswith(".log"))
+        for f in olds[:-BG_LOG_KEEP] if len(olds) > BG_LOG_KEEP else []:
+            try:
+                os.remove(os.path.join(d, f))
+            except OSError:
+                pass
+    except Exception:
+        pass
+    return path, open(path, "ab")
+
+
+def _spawn_bg_and_wait(c, rpath, penv, env, wait_max=BG_WAIT_MAX):
+    """后台拉起一个启动候选并等它真的起来。
+
+    返回 (status, rc, logpath, proc)：
+      ("bg",      None, path, proc) —— 端口探活成功，dsh 已在后台跑
+      ("exit",    rc,   path, proc) —— 进程自己退出了（rc==0 视为 dsh 主动退出）
+      ("timeout", None, path, proc) —— 等满 wait_max 秒还没探活，但进程仍活着
+    KeyboardInterrupt 直接向上抛（由调用方决定「只中断等待、不杀 dsh」）。
+    """
+    logpath, bg_f = _bg_logfile()
+    try:
+        proc = subprocess.Popen(c.get("cmdline") or c["argv"],
+                                cwd=rpath, env=penv,
+                                stdin=subprocess.DEVNULL,
+                                stdout=bg_f, stderr=bg_f,
+                                creationflags=BG_FLAGS)
+    finally:
+        # 子进程已继承句柄，启动器这边的可以关了
+        try:
+            bg_f.close()
+        except Exception:
+            pass
+    deadline = time.time() + max(5, wait_max)
+    while True:
+        if live_now(env):
+            return ("bg", None, logpath, proc)
+        rc = proc.poll()
+        if rc is not None:
+            return ("exit", rc, logpath, proc)
+        if time.time() >= deadline:
+            return ("timeout", None, logpath, proc)
+        time.sleep(BG_POLL)
+
+
+def _log_tail(path, n=12):
+    """读后台日志尾部给用户看（层5 的真错误只在这里）。"""
+    try:
+        with open(path, "rb") as f:
+            data = f.read()
+        lines = data.decode("utf-8", errors="replace").strip().splitlines()
+        for ln in lines[-n:]:
+            log("    | %s" % ln)
+    except Exception as e:
+        log("    | （日志读不出：%s）" % e)
+
+
+def action_restart():
+    """重启 dsh：结束现有实例 → 等端口真释放 → 走完整启动流程。
+
+    [!] 结束后必须等端口释放再启动 —— taskkill 是异步的，锁与监听
+        收尾要几秒，撞上残留就是一轮新的脏锁故障。
+    """
+    line("=")
+    log("  重启 dsh")
+    line("=")
+    log()
+    env = probe()
+    live = find_live_ports(env)
+    if live:
+        log("  正在结束 dsh（端口 %s）..." % ", ".join(map(str, live)))
+        kill_leftover(env)
+        if not _wait_ports_free(env):
+            log("  [!] 等了 %d 秒端口仍未释放 —— 继续可能撞残留。" % BG_WAIT_MAX)
+            log("      也可以稍后重试 [8]，或用结束-dsh.bat 后再 [1]。")
+            log()
+            if ask("      仍要继续启动吗？(y/N) > ").strip().lower() != "y":
+                return
+    else:
+        log("  dsh 当前没在跑 —— 直接启动。")
+    log()
+    if not acquire_instance_lock():
+        pause()
+        return
+    try:
+        _action_start_impl(assume_yes=False)
+    finally:
+        release_instance_lock()
+
+
+def _wait_ports_free(env, timeout=15):
+    """等 dsh 的端口真正释放（live_now 彻底安静），返回是否释放。"""
+    deadline = time.time() + timeout
+    while time.time() < deadline:
+        if not live_now(env):
+            return True
+        time.sleep(1)
+    return not live_now(env)
 
 
 def run_plugins(args=None):
@@ -603,13 +745,14 @@ MENU = """
   DeepSeek Harness  启动器
 ============================================================
 
-  [1] 启动 dsh                        （默认，直接回车）
+  [1] 启动 dsh                        （后台运行，回菜单）
   [2] 插件管理 —— 冲突检查 / 启用禁用
   [3] 只检查插件冲突
   [4] 补齐模块链接
   [5] 环境探测报告
   [6] 安全模式启动 —— 只留内置插件（dsh 起不来时的救命模式）
   [7] 恢复正式模式 —— 还原安全模式禁用的插件
+  [8] 重启 dsh —— 结束现有实例再启动
 
   [0] 退出
 """
@@ -691,7 +834,8 @@ def main():
             log("  未检测到按键 —— 自动启动 dsh。")
             log()
             action_start(assume_yes="--yes" in argv)
-            return 0
+            # 启动完回菜单（dsh 已在后台），不再整个退出
+            return _main_menu()
         log()
         log("  检测到按键 —— 进入菜单。")
         time.sleep(0.4)
@@ -719,10 +863,11 @@ def _main_menu():
         # [!] 各动作期间的 Ctrl+C 一律返回菜单，不再整个退出
         #     （旧行为：检查/探测 600 秒内按 Ctrl+C 会直接关掉启动器）
         try:
+            # [!] [1]/[6] 启动成功后不再退出启动器 —— dsh 已转后台，
+            #     回车即返回菜单（旧行为：dsh 一退整个窗口直接关掉）
             if low in ("", "1"):
                 action_start()
-                return 0
-            if low == "2":
+            elif low == "2":
                 run_plugins()
             elif low == "3":
                 action_check()
@@ -732,9 +877,10 @@ def _main_menu():
                 action_env()
             elif low == "6":
                 action_safe_start()
-                return 0
             elif low == "7":
                 action_restore()
+            elif low == "8":
+                action_restart()
             else:
                 log("  无效输入：%s" % cmd)
                 time.sleep(1.2)

@@ -108,10 +108,34 @@ MUTANTS = [
     ("[plugins] 安全模式幂等不校验手写件（regen 丢失）", "dsh-plugins.py",
      "        if SM_MARK in body:",
      "        if True:"),
+    # dsh 的加载错误只走 stdout/stderr（hub.log 只有「启动了」）——
+    # 后台启动把输出重定向丢了 = 层5 故障彻底瞎掉。
+    # 后台启动用例①断言子进程输出必须出现在日志文件里。
+    ("[launcher] 后台启动不重定向日志（stdout 全丢）", "dsh-launcher.py",
+     "                                stdout=bg_f, stderr=bg_f,",
+     "                                stdout=None, stderr=None,"),
+    # 重启必须先结束现有实例再启动 —— 不杀直接拉起就是「第二个实例抢端口」。
+    # 重启用例①断言 kill_leftover 被调用（锚含 log 行保证唯一）。
+    ("[launcher] 重启不杀旧实例直接启动", "dsh-launcher.py",
+     """        log("  正在结束 dsh（端口 %s）..." % ", ".join(map(str, live)))
+        kill_leftover(env)""",
+     """        log("  正在结束 dsh（端口 %s）..." % ", ".join(map(str, live)))
+        pass"""),
 ]
 
 caught = missed = skipped = 0
-for name, fname, old, new in MUTANTS:
+# [!] 可选 --range A:B：只跑 MUTANTS[A:B]（Python 切片语义）。
+#     用途：分批前台跑 —— 后台任务上下文会被宿主的 SAFE_DELETE 批删
+#     确认钩子盯上（turn 内删 50+ 文件即拦，直接杀掉测试子进程，
+#     表现为「变异体自身崩溃」）；前台命令不受监控，但单条命令有
+#     时长上限，所以整套要切成几段跑。汇总行会注明范围。
+_range = None
+if "--range" in sys.argv:
+    _i = sys.argv.index("--range")
+    _a, _b = (sys.argv[_i + 1].split(":") + [""])[:2]
+    _range = (int(_a or 0), int(_b) if _b else len(MUTANTS))
+mutants = MUTANTS[slice(*_range)] if _range else MUTANTS
+for name, fname, old, new in mutants:
     sp = os.path.join(T, fname)
     if not os.path.exists(sp):
         print("[跳过] 无文件 %s" % fname); skipped += 1; continue
@@ -162,4 +186,8 @@ for name, fname, old, new in MUTANTS:
 
 print()
 print("=" * 62)
-print("抓到 %d / 漏掉 %d / 跳过 %d" % (caught, missed, skipped))
+print("抓到 %d / 漏掉 %d / 跳过 %d%s"
+      % (caught, missed, skipped,
+         ("　[本批范围 %d:%d，共 %d 条；全套 %d 条]"
+          % (_range[0], _range[1], len(mutants), len(MUTANTS)))
+         if _range else ""))

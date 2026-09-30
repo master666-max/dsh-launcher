@@ -1317,6 +1317,105 @@ def t_safemode_badge():
         shutil.rmtree(d, ignore_errors=True)
 
 
+@case("后台启动：分离进程 + 探活轮换 + 日志落盘（绝不丢 stdout）")
+def t_bg_start():
+    L = _load_launcher('dsh_launcher_bg')
+    real_live = L.live_now
+    tmp = tempfile.mkdtemp(prefix="dsh_t_bg_")
+    procs = []
+    try:
+        py = sys.executable
+        penv = os.environ.copy()
+        # ① 探活成功 → ("bg")，且子进程输出必须落进日志文件
+        #    （dsh 的加载错误只走 stdout —— 丢了 = 层5 故障瞎掉）
+        marker = "BG-MARKER-%d" % os.getpid()
+        L.live_now = lambda env=None: True
+        c1 = {"label": "t1",
+              "argv": [py, "-c", "import time;print(%r,flush=True);time.sleep(30)" % marker]}
+        st, rc, lp, proc = L._spawn_bg_and_wait(c1, tmp, penv, None, wait_max=6)
+        procs.append(proc)
+        expect(st == "bg" and rc is None,
+               "探活成功应返回 bg，实际 %r rc=%r" % (st, rc))
+        # 子进程冷启动要时间（沙箱下 1 秒+）—— 轮询等 marker，不赌固定时延
+        deadline = time.time() + 6
+        body = b""
+        while time.time() < deadline:
+            try:
+                body = open(lp, "rb").read()
+            except OSError:
+                body = b""
+            if marker.encode() in body:
+                break
+            time.sleep(0.3)
+        expect(marker in body.decode("utf-8", errors="replace"),
+               "子进程输出必须落在后台日志（层5 排查靠它），实际前 200 字：%r"
+               % body[:200])
+        # ② 秒退 rc!=0 → ("exit", rc)，供调用方换下一个候选
+        L.live_now = lambda env=None: False
+        c2 = {"label": "t2", "argv": [py, "-c", "import sys;sys.exit(3)"]}
+        st2, rc2, lp2, proc2 = L._spawn_bg_and_wait(c2, tmp, penv, None, wait_max=6)
+        expect(st2 == "exit" and rc2 == 3,
+               "秒退应返回 exit/3，实际 %r/%r" % (st2, rc2))
+        # ③ 探活恒 False 且进程活着 → ("timeout")，绝不能当失败去拉第二个
+        c3 = {"label": "t3", "argv": [py, "-c", "import time;time.sleep(30)"]}
+        st3, rc3, lp3, proc3 = L._spawn_bg_and_wait(c3, tmp, penv, None, wait_max=6)
+        procs.append(proc3)
+        expect(st3 == "timeout" and rc3 is None,
+               "探不活且进程在应返回 timeout，实际 %r/%r" % (st3, rc3))
+        # ④ 成功返回的 proc 必须是活的真进程（PID 可供用户查/杀）
+        expect(proc is not None and proc.pid > 0,
+               "必须带回进程句柄（用户要看 PID）")
+    finally:
+        L.live_now = real_live
+        for p in procs:
+            try:
+                p.kill()
+            except Exception:
+                pass
+        shutil.rmtree(tmp, ignore_errors=True)
+
+
+@case("重启 dsh：必须先结束现有实例并等端口释放，再走完整启动流程")
+def t_restart():
+    L = _load_launcher('dsh_launcher_restart')
+    calls = {"kill": 0, "wait": 0, "start": 0}
+    real = (L.probe, L.find_live_ports, L.kill_leftover, L._wait_ports_free,
+            L._action_start_impl, L.acquire_instance_lock,
+            L.release_instance_lock, L.pause)
+    try:
+        L.probe = lambda force=False: {"port": {"value": 3080}}
+        L.pause = lambda *a, **k: None
+        L.acquire_instance_lock = lambda: True
+        L.release_instance_lock = lambda: None
+        L._action_start_impl = lambda assume_yes, safe=False: calls.__setitem__(
+            "start", calls["start"] + 1)
+        L.kill_leftover = lambda e: calls.__setitem__("kill", calls["kill"] + 1)
+        L._wait_ports_free = lambda e, timeout=15: calls.__setitem__(
+            "wait", calls["wait"] + 1) or True
+
+        # ① 检测到在跑：必须 kill → 等端口 → 转交完整启动
+        L.find_live_ports = lambda env: [3080]
+        L.action_restart()
+        expect(calls["kill"] == 1, "检测到 live 必须先结束实例，实际 %r" % calls)
+        expect(calls["wait"] == 1, "结束完必须等端口释放（taskkill 是异步的），实际 %r" % calls)
+        expect(calls["start"] == 1, "收尾必须转交完整启动流程（含锁/清锁/自愈），实际 %r" % calls)
+
+        # ② 没在跑：不该 kill，仍要启动
+        calls.update(kill=0, wait=0, start=0)
+        L.find_live_ports = lambda env: []
+        L.action_restart()
+        expect(calls["kill"] == 0 and calls["wait"] == 0,
+               "没在跑就不该结束/等待，实际 %r" % calls)
+        expect(calls["start"] == 1, "没在跑也要直接启动，实际 %r" % calls)
+
+        # ③ 菜单必须有 [8]
+        expect("[8]" in L.MENU and "重启" in L.MENU, "菜单应有 [8] 重启 dsh")
+    finally:
+        (L.probe, L.find_live_ports, L.kill_leftover, L._wait_ports_free,
+         L._action_start_impl, L.acquire_instance_lock,
+         L.release_instance_lock, L.pause) = real
+
+
 # ============================================================
 # 运行
 # ============================================================
