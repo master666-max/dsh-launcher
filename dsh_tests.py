@@ -1663,6 +1663,18 @@ def t_update_pull_guards():
         shutil.rmtree(tmp, ignore_errors=True)
 
 
+@case("update：rev-list 输出解析 —— 畸形/空 => None（不是 0）")
+def t_update_parse_count():
+    import dsh_update as U
+    expect(U._parse_count("2\n") == 2, "正常输出应解析出 2（实际 %r）" % U._parse_count("2"))
+    expect(U._parse_count("0") == 0, "真的是 0 时应返回 0")
+    expect(U._parse_count("") is None, "空输出 => None（别谎报已是最新）")
+    expect(U._parse_count("   \n") is None, "空白输出 => None")
+    expect(U._parse_count("not-a-number") is None, "畸形输出 => None")
+    expect(U._parse_count(None) is None, "None 输入 => None")
+    expect(U._parse_count("12 34") == 12, "多列输出取第一列")
+
+
 if __name__ == "__main__":
     # dsh-plugins.py 文件名带连字符，需用 importlib 加载
     import importlib.util

@@ -126,7 +126,7 @@ MUTANTS = [
     #    （这条是回归用例真抓到的 bug：behind<=0 分支把 0 当"状态过期"）
     ("[update] behind=0 也当过期 → 免拉闸失效", "dsh_update.py",
      "    if behind == 0:\n        return True, \"已是最新，无需拉取\"",
-     "    if behind <= 0:\n        pass\n    if behind == 0:\n        return True, \"已是最新，无需拉取\""),
+     "    if behind <= 0:\n        behind = behind_count(repo)"),
     # ② 节流窗口恒真 ⇒ 每次双击都打网络（违背「不重复打远端」）
     ("[update] 节流恒真（每次启动都 fetch）", "dsh_update.py",
      "        return (_now() - int(state.get(\"checked_at\") or 0)) < TTL_SECONDS",
@@ -146,11 +146,11 @@ MUTANTS = [
     # ⑥ 查不到落后数时谎报 0（"没查过"被读成"已是最新"——本仓最恨的凭空造数）
     ("[update] 查不到落后数谎报 0", "dsh_update.py",
      """    try:
-        return int(out.split()[0])
+        return int(s.split()[0])
     except Exception:
         return None""",
      """    try:
-        return int(out.split()[0])
+        return int(s.split()[0])
     except Exception:
         return 0"""),
     # ⑦ badge 失败时不静默 ⇒ 菜单被"检查失败"噪音污染

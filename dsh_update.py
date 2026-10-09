@@ -163,6 +163,22 @@ def upstream_ref(repo):
     return "origin/master" if rc == 0 and out else ""
 
 
+def _parse_count(out):
+    """把 `git rev-list --count` 的输出解析成 int。**解析不了 => None**（不是 0）。
+
+    单独抽出来是为了能直接测它：原先这段埋在 behind_count 的 try 里，
+    「输出畸形」那条分支在正常仓库路径上**不可达**（变异体等于没测）。
+    「查不到」和「0」是两件事 —— 这里返回 None 就是「查不到」。
+    """
+    s = (out or "").strip()
+    if not s:
+        return None
+    try:
+        return int(s.split()[0])
+    except Exception:
+        return None
+
+
 def behind_count(repo):
     """落后基准分支几个提交。**没有基准/命令失败 => None**（不是 0！
 
