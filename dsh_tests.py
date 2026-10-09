@@ -1675,6 +1675,77 @@ def t_update_parse_count():
     expect(U._parse_count("12 34") == 12, "多列输出取第一列")
 
 
+@case("update：更新成功后记下「从哪来」（回退锚点）")
+def t_update_pull_records_anchor():
+    import dsh_update as U
+    tmp, bare, work, local = _upd_fixture()
+    try:
+        with _upd_env(local) as m:
+            before = U.head_full(local)
+            m.write_state({"state": "ok", "behind": 2, "repo": local, "checked_at": m._now()})
+            ok, msg = m.do_pull()
+            expect(ok, "拉取应成功（%r）" % msg)
+            after = U.head_full(local)
+            expect(after != before, "拉取后 HEAD 应变化")
+            lp = m.read_state().get("last_pull") or {}
+            expect(lp.get("from") == before, "last_pull.from 必须是**拉取前**的 sha（实际 %r）" % lp.get("from"))
+            expect(lp.get("to") == after, "last_pull.to 应是拉取后的 sha")
+            expect(lp.get("count") == 2, "应记下拉了几个提交（实际 %r）" % lp.get("count"))
+            expect("回退" in msg, "成功提示里要告诉用户能回退：%r" % msg)
+    finally:
+        shutil.rmtree(tmp, ignore_errors=True)
+
+
+@case("update：回退 —— 拉回更新前的 sha（不动分支历史）")
+def t_update_rollback_works():
+    import dsh_update as U
+    tmp, bare, work, local = _upd_fixture()
+    try:
+        with _upd_env(local) as m:
+            before = U.head_full(local)
+            branch = U.run_git(local, ["rev-parse", "--abbrev-ref", "HEAD"], 8)[1]
+            m.write_state({"state": "ok", "behind": 2, "repo": local, "checked_at": m._now()})
+            expect(m.do_pull()[0], "先拉取成功")
+            expect(U.head_full(local) != before, "此刻 HEAD 应已前移")
+            ok, msg = m.do_rollback()
+            expect(ok, "回退应成功（%r）" % msg)
+            expect(U.head_full(local) == before, "回退后 HEAD 应等于更新前的 sha")
+            expect(m.read_state().get("behind") == 2, "回退后落后数应重新算出来")
+            # 用 checkout --detach 而不是 reset --hard：分支历史不能动
+            now_branch = U.run_git(local, ["rev-parse", "--abbrev-ref", "HEAD"], 8)[1]
+            expect(now_branch != branch, "回退后应是游离 HEAD（实际还在 %r）" % now_branch)
+    finally:
+        shutil.rmtree(tmp, ignore_errors=True)
+
+
+@case("update：回退三闸 —— 无记录 / sha 不存在 / 脏工作区")
+def t_update_rollback_guards():
+    import dsh_update as U
+    tmp, bare, work, local = _upd_fixture()
+    try:
+        with _upd_env(local) as m:
+            # ① 无记录
+            m.write_state({"state": "ok", "behind": 2, "repo": local, "checked_at": m._now()})
+            ok, msg = m.do_rollback()
+            expect(not ok and "没有回退记录" in msg, "无记录应拒绝（实际 %r,%r）" % (ok, msg))
+            # ② 记录的 sha 不存在（被 gc）
+            m.write_state({"state": "ok", "behind": 2, "repo": local,
+                           "last_pull": {"from": "0" * 40, "from_short": "000000000"},
+                           "checked_at": m._now()})
+            ok, msg = m.do_rollback()
+            expect(not ok and "不在仓库" in msg, "sha 不存在应拒绝（实际 %r,%r）" % (ok, msg))
+            # ③ 脏工作区
+            before = U.head_full(local)
+            m.write_state({"state": "ok", "behind": 2, "repo": local, "checked_at": m._now()})
+            expect(m.do_pull()[0], "先拉取成功")
+            open(os.path.join(local, "dirty.txt"), "w").write("x")
+            ok, msg = m.do_rollback()
+            expect(not ok and "未提交" in msg, "脏工作区应拒绝（实际 %r,%r）" % (ok, msg))
+            expect(U.head_full(local) != before, "被拒时 HEAD 不该动")
+    finally:
+        shutil.rmtree(tmp, ignore_errors=True)
+
+
 if __name__ == "__main__":
     # dsh-plugins.py 文件名带连字符，需用 importlib 加载
     import importlib.util

@@ -508,6 +508,34 @@ def _update_badge():
         return ""
 
 
+def _offer_rollback():
+    """顺手给一次回退机会（更新后不合适时用）。返回 True = 已处理，调用方可 return。
+
+    只在**有回退记录**时才有话说；没有就安静返回 False（不改菜单流程）。
+    """
+    try:
+        import dsh_update
+    except Exception:
+        return False
+    sha = dsh_update.rollback_target()
+    if not sha:
+        return False
+    log("")
+    ok, info = dsh_update.can_rollback()
+    log("  上次更新前的版本：%s" % sha[:9])
+    if not ok:
+        log("  （%s）" % info)
+        return True
+    if not ask("  要回退到它吗？（工作区有未提交改动会被拒绝）[y/N] > "):
+        log("  已取消（dsh 不受影响）。")
+        return True
+    ok2, msg = dsh_update.do_rollback()
+    log(("  \u221a " if ok2 else "  \u00d7 ") + msg)
+    if ok2:
+        log("  提示：回退完源码已换回旧版，**重启 dsh 才生效** —— 菜单 [8]")
+    return True
+
+
 def action_update():
     """[9] 检查并拉取 dsh 上游更新（**由人触发**，后台检查只负责提示）。
 
@@ -893,6 +921,24 @@ def main():
     if "--env" in argv:
         action_env()
         return 0
+    if "--update-rollback" in argv:
+        # 更新不合适时的回退（只切 HEAD，不改分支历史）
+        try:
+            import dsh_update
+            ok0, info0 = dsh_update.can_rollback()
+            if not ok0:
+                log("  不用回退：%s" % info0)
+                return 0
+            log("  即将回退到：%s" % dsh_update.rollback_target()[:9])
+            if "--yes" not in argv and not ask("  确认回退？[y/N] > "):
+                log("  已取消。")
+                return 0
+            ok, msg = dsh_update.do_rollback()
+            log(("  \u221a " if ok else "  \u00d7 ") + msg)
+            return 0 if ok else 1
+        except Exception as e:
+            log("  回退失败：%s" % e)
+            return 1
     if "--update-check" in argv:
         # 只查不拉：给脚本/CI 用（不启动 dsh、不进菜单）
         try:

@@ -204,6 +204,20 @@ def head_short(repo):
     return out if rc == 0 and out else ""
 
 
+def head_full(repo):
+    """本机 HEAD **完整** sha —— 回退要用（短 hash 可能撞车，git 也不接受）。"""
+    rc, out = run_git(repo, ["rev-parse", "HEAD"], QUERY_TIMEOUT)
+    return out if rc == 0 and out else ""
+
+
+def commit_exists(repo, sha):
+    """这个 commit 还在吗（可能被 gc / 从未有过）—— 回退前必须问。"""
+    if not sha:
+        return False
+    rc, _ = run_git(repo, ["cat-file", "-e", "%s^{commit}" % sha], QUERY_TIMEOUT)
+    return rc == 0
+
+
 def upstream_subject(repo):
     """上游最新一条提交标题（给用户看"要更新到什么"）。"""
     u = upstream_ref(repo)
@@ -320,13 +334,89 @@ def do_pull():
     if is_dirty(repo):
         return False, ("工作区有未提交改动（%d 项），已拒绝拉取 —— "
                        "先 commit 或 stash 再试" % len(run_git(repo, ["status", "--porcelain"], QUERY_TIMEOUT)[1].splitlines()))
+    # [!] **先记住"从哪来"** —— 更新后要是不满意，回退就靠这条记录。
+    #     必须**在 pull 之前**取（pull 后 HEAD 已变）；记在状态文件里，
+    #     不动仓库（不打 tag、不建分支、不碰用户的 git 状态）。
+    prev_full = head_full(repo)
     rc, out = run_git(repo, ["pull", "--ff-only", "--quiet"], FETCH_TIMEOUT)
     if rc != 0:
         return False, "拉取失败：%s" % (out or "git pull 返回 %s" % rc)
     new_head = head_short(repo)
-    write_state({"state": STATE_OK, "checked_at": _now(), "behind": 0,
-                 "head": new_head, "repo": repo})
-    return True, "已快进到 %s（拉了 %d 个提交）。**重启 dsh 后生效**：启动器 [8]" % (new_head or "?", behind)
+    new_full = head_full(repo)
+    st = {"state": STATE_OK, "checked_at": _now(), "behind": 0,
+          "head": new_head, "repo": repo}
+    if prev_full and new_full and prev_full != new_full:
+        st["last_pull"] = {"from": prev_full, "from_short": prev_full[:9],
+                           "to": new_full, "to_short": new_head,
+                           "count": behind, "at": _now()}
+    write_state(st)
+    msg = "已快进到 %s（拉了 %d 个提交）。**重启 dsh 后生效**：启动器 [8]" % (new_head or "?", behind)
+    if st.get("last_pull"):
+        msg += "\n     万一不合适：菜单 [9] 可回退到 %s" % st["last_pull"]["from_short"]
+    return True, msg
+
+
+# ── 回退（更新后不满意 ⇒ 回到更新前的那个 commit）──────────────────────────
+def rollback_target():
+    """可回退的目标：上次更新前的那个 commit。没记录返回 ""。
+
+    存在状态文件的 `last_pull.from`；**不额外查 git**（菜单渲染要毫秒级，
+    真校验留到真的要回退时）。
+    """
+    try:
+        lp = read_state().get("last_pull") or {}
+        return str(lp.get("from") or "")
+    except Exception:
+        return ""
+
+
+def can_rollback():
+    """能不能回退：有记录 + 那个 commit 还在 + 当前 HEAD 不是它。"""
+    sha = rollback_target()
+    if not sha:
+        return False, "没有回退记录（上次更新是本工具之外做的，或还没更新过）"
+    repo = read_state().get("repo") or repo_path_quick()
+    if not repo:
+        return False, "定位不到仓库"
+    if not commit_exists(repo, sha):
+        return False, "记录里的版本 %s 已不在仓库里（可能被 gc 了）—— 无法回退" % sha[:9]
+    cur = head_full(repo)
+    if cur and cur == sha:
+        return False, "当前已经在 %s 上，没什么可回退的" % sha[:9]
+    return True, repo
+
+
+def do_rollback():
+    """回退到上次更新前的版本。**永不抛**，返回 (ok, msg)。
+
+    两道闸 + 一个选择：
+    ① 工作区脏 ⇒ 拒绝（回退不该吃掉别人的改动）；
+    ② 目标 commit 不存在 ⇒ 拒绝；
+    ③ 用 `git checkout --detach <sha>` 而不是 `reset --hard`：
+       **不改动任何分支的历史**，出问题也能再 checkout 回来。
+    """
+    ok, info = can_rollback()
+    if not ok:
+        return False, info
+    repo = info
+    sha = rollback_target()
+    if is_dirty(repo):
+        n = len(run_git(repo, ["status", "--porcelain"], QUERY_TIMEOUT)[1].splitlines())
+        return False, ("工作区有未提交改动（%d 项），已拒绝回退 —— "
+                       "先 commit 或 stash 再试" % n)
+    rc, out = run_git(repo, ["checkout", "--detach", sha], FETCH_TIMEOUT)
+    if rc != 0:
+        return False, "回退失败：%s" % (out or "git checkout 返回 %s" % rc)
+    now = head_short(repo)
+    st = read_state()
+    st["state"] = STATE_OK
+    st["checked_at"] = _now()
+    st["head"] = now
+    st["behind"] = behind_count(repo)
+    st["rolled_back_at"] = _now()
+    write_state(st)
+    return True, ("已回退到 %s（游离 HEAD）。**重启 dsh 后生效**：启动器 [8]\n"
+                  "     想回到分支：git checkout main" % (now or sha[:9]))
 
 
 # ── 菜单呈现（毫秒级）──────────────────────────────────────────────────────
@@ -351,7 +441,11 @@ def badge():
     if st.get("detached"):
         return ("  ⬆ 落后 %s %d 个提交（当前游离 HEAD %s）—— 拉取需先切分支\n"
                 % (ref, behind, head or "?"))
-    return "  ⬆ %s 有 %d 个新提交（当前 %s）—— 菜单 [9] 可拉取\n" % (ref, behind, head or "?")
+    line = "  ⬆ %s 有 %d 个新提交（当前 %s）—— 菜单 [9] 可拉取\n" % (ref, behind, head or "?")
+    if st.get("last_pull") and st["last_pull"].get("from_short"):
+        line += "     上次更新：%s → %s（不合适可用 [9] 回退）\n" % (
+            st["last_pull"].get("from_short"), st["last_pull"].get("to_short") or "?")
+    return line
 
 
 def summary_lines():
@@ -365,6 +459,13 @@ def summary_lines():
              "落后：%d 个提交" % behind]
     if behind > 0 and st.get("subject"):
         lines.append("上游最新：%s" % st["subject"])
+    lp = st.get("last_pull") or {}
+    if lp.get("from_short"):
+        lines.append("上次更新：%s -> %s（%d 个提交，%s）"
+                     % (lp.get("from_short"), lp.get("to_short") or "?",
+                        lp.get("count", 0),
+                        time.strftime("%Y-%m-%d %H:%M", time.localtime(lp.get("at") or 0))))
+        lines.append("要回退：python dsh-launcher.py --update-rollback")
     return lines
 
 
