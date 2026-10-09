@@ -949,6 +949,21 @@ def discover_start_cmds(repo, profile_name, cfg, notes):
     else:
         prof_ok = True
 
+    # [!] 2026-10-10 实测：360 类防护拦截【cmd.exe 链条】里 node 的 symlink
+    #     创建 —— pnpm.cmd→node、cmd /c node 全部 EPERM（dsh 启动时
+    #     composeProfile 要建几百个 fallback symlink，走 cmd 链必死）；
+    #     而 python/bash 直派生的 node 不拦（同位置同目标实测成功）。
+    #     故「node 直派生 tsx 入口」提为第一优先，绕开 cmd 中间层。
+    node_exe = find_node()
+    for entry in (os.path.join("apps", "cli", "src", "bin.ts"),
+                  os.path.join("apps", "cli", "src", "bin.js"),
+                  os.path.join("apps", "cli", "bin.js")):
+        if node_exe and os.path.exists(os.path.join(repo, entry)):
+            push("node 直派生 %s %s（绕开 cmd 链：symlink 防护不拦）"
+                 % (entry, prof),
+                 [node_exe, "--import", "tsx/esm", entry, prof])
+            break
+
     rc, help_out, _ = _run(["cmd.exe", "/c", pm, "dsh", "--help"],
                            timeout=90, cwd=repo)
     subs = parse_help_commands(help_out) if rc == 0 else []
@@ -975,25 +990,15 @@ def discover_start_cmds(repo, profile_name, cfg, notes):
         _tag = "（缺 --profile 会立即退）" if s != "web" else ""
         push("dsh %s%s" % (s, _tag), ["cmd.exe", "/c", pm, "dsh", s])
 
-    # tsx 源码入口（一定是最新代码，但每次现编译，慢）
-    for entry in (os.path.join("apps", "cli", "src", "bin.ts"),
-                  os.path.join("apps", "cli", "src", "bin.js"),
-                  os.path.join("apps", "cli", "bin.js")):
-        if os.path.exists(os.path.join(repo, entry)):
-            push("node --import tsx/esm %s %s（源码现编译：最新但最慢）"
-                 % (entry, prof),
-                 ["cmd.exe", "/c", "node", "--import", "tsx/esm", entry, prof])
-            break
-
-    # 预编译入口（最快，但非官方路径）—— 兜底
+    # [!] 预编译入口改为直派生（同上：cmd 链的 node symlink 会被拦）
     try:
         pre = prebuilt_entry(repo)
     except Exception:
         pre = None
-    if pre and cmd_arg_safe(pre):
-        push("node apps/cli/lib/bin.js %s（兜底：预编译入口）" % prof,
-             ["cmd.exe", "/c", find_node(), pre, prof])
-        notes.append("预编译入口已降为兜底候选（官方方式优先）")
+    if pre and cmd_arg_safe(pre) and node_exe:
+        push("node apps/cli/lib/bin.js %s（兜底：预编译入口，直派生）" % prof,
+             [node_exe, pre, prof])
+        notes.append("预编译入口已降为兜底候选（官方方式优先），并改为 node 直派生")
     elif pre:
         notes.append("预编译入口路径含 cmd 元字符，跳过该兜底候选")
 
