@@ -12,6 +12,7 @@ dsh 启动器（终端菜单）
   [5] 环境探测报告
   [6] 安全模式启动（禁用全部外部插件）
   [7] 恢复正式模式（还原安全模式禁掉的插件）
+  [9] 检查并拉取 dsh 上游更新（只快进）
   [0] 退出
 
 本文件**只做编排与交互**：所有 dsh 相关知识（仓库/profile/端口/命令/锁/进程）
@@ -495,6 +496,66 @@ def _log_tail(path, n=12):
         log("    | （日志读不出：%s）" % e)
 
 
+def _update_badge():
+    """菜单里的更新状态行（读缓存 JSON，毫秒级 —— 与 _safe_badge 同纪律）。
+
+    检查失败/无 => 空行（静默）。菜单第一屏绝不因此变慢。
+    """
+    try:
+        import dsh_update
+        return dsh_update.badge()
+    except Exception:
+        return ""
+
+
+def action_update():
+    """[9] 检查并拉取 dsh 上游更新（**由人触发**，后台检查只负责提示）。
+
+    拉取的三道闸都在 dsh_update.do_pull 里：落后为 0 不拉、工作区脏不拉、
+    游离 HEAD 不拉（会改 HEAD 指向）；只 --ff-only，不产生合并提交。
+    **拉完不自动重启** —— 重启是人的决定（[8]）。
+    """
+    line("=")
+    log("  dsh 更新")
+    line("=")
+    try:
+        import dsh_update
+    except Exception as e:
+        log("  更新模块不可用：%s" % e)
+        pause()
+        return
+
+    st = dsh_update.do_check(force=True)      # 人点了 => 允许重新查（绕过节流）
+    if st.get("state") != dsh_update.STATE_OK:
+        log("  检查失败：%s" % (st.get("why") or "未知原因"))
+        log("  （不影响启动：dsh 照常可用）")
+        pause()
+        return
+
+    behind = st.get("behind", 0)
+    log("  当前 HEAD：%s" % (st.get("head") or "?"))
+    log("  基准：%s%s" % (st.get("upstream") or "?",
+                           "（游离 HEAD）" if st.get("detached") else ""))
+    log("  落后：%d 个提交" % behind)
+    if behind > 0 and st.get("subject"):
+        log("  上游最新：%s" % st["subject"])
+    if behind <= 0:
+        log("  √ 已是最新")
+        pause()
+        return
+
+    if not ask("  拉取这 %d 个提交？只快进，不合并 [y/N] > "):
+        log("  已取消（dsh 不受影响）。")
+        pause()
+        return
+
+    ok, msg = dsh_update.do_pull()
+    log(("  √ " if ok else "  × ") + msg)
+    if ok:
+        log("  提示：源码已更新，**需要重启 dsh 才生效** —— 菜单 [8] 重启 dsh")
+    pause()
+
+
 def action_restart():
     """重启 dsh：结束现有实例 → 等端口真释放 → 走完整启动流程。
 
@@ -753,6 +814,7 @@ MENU = """
   [6] 安全模式启动 —— 只留内置插件（dsh 起不来时的救命模式）
   [7] 恢复正式模式 —— 还原安全模式禁用的插件
   [8] 重启 dsh —— 结束现有实例再启动
+  [9] 检查并拉取 dsh 更新 —— 只快进，不自动重启
 
   [0] 退出
 """
@@ -811,6 +873,17 @@ def _safe_badge():
 def main():
     argv = sys.argv[1:]
 
+    # ---- 上游更新：后台线程 + 三道闸（不阻碍启动）----
+    # ① 立即返回，**不 join**：dsh 启动与菜单都不等它；
+    # ② 检查内部只用 detect() 的落盘缓存 + 有界超时，慢就放弃；
+    # ③ 一小时内查过就不再查（不重复打网络）。
+    # 失败一律静默 —— 启动器的第一屏绝不能被"检查更新"拖住。
+    try:
+        import dsh_update
+        dsh_update.spawn_background_check()
+    except Exception:
+        pass
+
     if "--start" in argv:
         action_start(assume_yes="--yes" in argv)
         return 0
@@ -819,6 +892,15 @@ def main():
         return 0
     if "--env" in argv:
         action_env()
+        return 0
+    if "--update-check" in argv:
+        # 只查不拉：给脚本/CI 用（不启动 dsh、不进菜单）
+        try:
+            import dsh_update
+            for ln in dsh_update.summary_lines():
+                log(ln)
+        except Exception as e:
+            log("  检查更新失败：%s" % e)
         return 0
 
     # ---- 首屏：1 秒窗口 ----
@@ -850,7 +932,7 @@ def _main_menu():
             os.system("cls")
         else:
             os.system("clear")
-        log(MENU + _safe_badge())
+        log(MENU + _safe_badge() + _update_badge())
         try:
             cmd = input("  选择 [1] > ").strip()
         except (EOFError, KeyboardInterrupt):
@@ -881,6 +963,8 @@ def _main_menu():
                 action_restore()
             elif low == "8":
                 action_restart()
+            elif low == "9":
+                action_update()
             else:
                 log("  无效输入：%s" % cmd)
                 time.sleep(1.2)

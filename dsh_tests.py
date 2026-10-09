@@ -1461,6 +1461,208 @@ def t_l6_excluded_ranges():
     expect(dsh_env._port_in_ranges(1283, ranges) is False, "1283 恰在两范围缝隙 → 不命中")
 
 
+# ============================================================
+# 7. 上游更新检查（dsh_update）—— 真实 git 仓库做样本，不用 mock 假装
+# ============================================================
+def _git_cmd(repo, *args):
+    """跑真 git。样本纪律：**真实形态**（bare origin + clone + 真提交）。"""
+    g = shutil.which("git") or r"C:\Program Files\Git\cmd\git.exe"
+    r = subprocess.run([g, "-C", repo] + list(args), capture_output=True, timeout=30,
+                       creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0))
+    return r.returncode, r.stdout.decode("utf-8", "replace").strip()
+
+
+def _upd_fixture():
+    """造一个「远端领先 2 个提交」的真仓库。
+
+    返回 (tmp, bare, work, local)：local 是 clone（**有 upstream**），
+    work 之后再 commit 两次 => local 落后 2。
+    """
+    tmp = tempfile.mkdtemp(prefix="dshupd_")
+    bare = os.path.join(tmp, "origin.git")
+    work = os.path.join(tmp, "work")
+    local = os.path.join(tmp, "local")
+    _git_cmd(tmp, "init", "--bare", bare)
+    _git_cmd(tmp, "clone", bare, work)
+    _git_cmd(work, "config", "user.email", "t@t")
+    _git_cmd(work, "config", "user.name", "t")
+    open(os.path.join(work, "a.txt"), "w").write("1")
+    _git_cmd(work, "add", "-A")
+    _git_cmd(work, "commit", "-m", "c1")
+    _git_cmd(work, "push", "origin", "HEAD")
+    _git_cmd(tmp, "clone", bare, local)
+    _git_cmd(local, "config", "user.email", "t@t")
+    _git_cmd(local, "config", "user.name", "t")
+    # 远端再进 2 个提交
+    for i in (2, 3):
+        open(os.path.join(work, "a.txt"), "w").write(str(i))
+        _git_cmd(work, "add", "-A")
+        _git_cmd(work, "commit", "-m", "c%d" % i)
+    _git_cmd(work, "push", "origin", "HEAD")
+    _git_cmd(local, "fetch", "--quiet")
+    return tmp, bare, work, local
+
+
+class _upd_env:
+    """把 dsh_update 的状态文件与仓库定位指到临时副本（绝不碰真实状态）。"""
+
+    def __init__(self, repo):
+        import dsh_update
+        self.m = dsh_update
+        self.tmp = tempfile.mkdtemp(prefix="dshupdstate_")
+        self.old_file = dsh_update.STATE_FILE
+        self.old_dir = dsh_update.STATE_DIR
+        self.old_quick = dsh_update.repo_path_quick
+        dsh_update.STATE_DIR = self.tmp
+        dsh_update.STATE_FILE = os.path.join(self.tmp, "update-check.json")
+        dsh_update.repo_path_quick = lambda: repo
+
+    def __enter__(self):
+        return self.m
+
+    def __exit__(self, *a):
+        self.m.STATE_FILE = self.old_file
+        self.m.STATE_DIR = self.old_dir
+        self.m.repo_path_quick = self.old_quick
+        shutil.rmtree(self.tmp, ignore_errors=True)
+
+
+@case("update：状态文件往返 + 损坏 JSON 不抛 + 原子写")
+def t_update_state_roundtrip():
+    import dsh_update as U
+    with _upd_env(os.getcwd()) as m:
+        expect(m.write_state({"state": "ok", "behind": 3, "checked_at": 1}), "写状态应成功")
+        expect(m.read_state().get("behind") == 3, "往返应读回 behind=3")
+        # 损坏 JSON => 空 dict（不抛），这是菜单每帧都会遇到的情况
+        open(m.STATE_FILE, "w", encoding="utf-8").write("{ 坏 json")
+        expect(m.read_state() == {}, "损坏 JSON 应回落空 dict")
+        expect(m.write_state({"x": 1}) and os.path.exists(m.STATE_FILE), "原子写应落盘")
+        expect(not os.path.exists(m.STATE_FILE + ".tmp"), "临时文件应已被 replace 掉")
+
+
+@case("update：节流 —— 1 小时内跳过；force/失败态不跳过")
+def t_update_throttle():
+    import dsh_update as U
+    with _upd_env(os.getcwd()) as m:
+        now = m._now()
+        expect(m.fresh_enough({"state": "ok", "checked_at": now}) is True, "刚查过应新鲜")
+        expect(m.fresh_enough({"state": "ok", "checked_at": now - 60}) is True, "60s 前仍新鲜")
+        expect(m.fresh_enough({"state": "ok", "checked_at": now - m.TTL_SECONDS - 10}) is False,
+               "超过窗口应过期")
+        expect(m.fresh_enough({"state": "ok", "checked_at": now}, force=True) is False,
+               "force 必须绕过节流")
+        expect(m.fresh_enough({"state": "fail", "checked_at": now}) is False,
+               "**失败不该被缓存一小时**（下次启动应重试）")
+
+
+@case("update：落后计数（真仓库：远端领先 2）")
+def t_update_behind_count():
+    import dsh_update as U
+    tmp, bare, work, local = _upd_fixture()
+    try:
+        with _upd_env(local) as m:
+            n = m.behind_count(local)
+            expect(n == 2, "local 应落后 2 个提交（实际 %r）" % n)
+            # ahead 是另一回事：改写成 0 也不该影响 behind
+            expect(m.upstream_ref(local).endswith("origin/master")
+                   or m.upstream_ref(local).endswith("origin/main"),
+                   "基准应是 origin/<默认分支>（实际 %r）" % m.upstream_ref(local))
+    finally:
+        shutil.rmtree(tmp, ignore_errors=True)
+
+
+@case("update：没有基准 => behind 是 None 而不是 0（别撒谎）")
+def t_update_no_upstream():
+    import dsh_update as U
+    empty = tempfile.mkdtemp(prefix="dshupdempty_")
+    try:
+        with _upd_env(empty) as m:
+            expect(m.behind_count(empty) is None, "非 git 目录 => None（不是 0）")
+            expect(m.behind_count(os.path.join(empty, "不存在")) is None, "路径不存在 => None")
+    finally:
+        shutil.rmtree(empty, ignore_errors=True)
+
+
+@case("update：detached HEAD 能识别，且基准退到 origin/HEAD")
+def t_update_detached():
+    import dsh_update as U
+    tmp, bare, work, local = _upd_fixture()
+    try:
+        _git_cmd(local, "checkout", "--detach", "HEAD")
+        with _upd_env(local) as m:
+            expect(m.detached(local) is True, "游离 HEAD 应识别为 detached")
+            ref = m.upstream_ref(local)
+            expect(ref != "", "detached 也要能拿到基准（origin/HEAD），实际空")
+            expect(m.behind_count(local) == 2, "detached 下仍应能算落后（实际 %r）"
+                   % m.behind_count(local))
+            expect(m.detached(work) is False, "正常分支不应误报 detached")
+    finally:
+        shutil.rmtree(tmp, ignore_errors=True)
+
+
+@case("update：git 超时不抛（返回 None,''）")
+def t_update_timeout_no_raise():
+    import dsh_update as U
+    tmp, bare, work, local = _upd_fixture()
+    try:
+        rc, out = U.run_git(local, ["log"], 0.001)     # 必然超时
+        expect(rc is None and out == "", "超时应返回 (None,'')（实际 %r,%r）" % (rc, out))
+        rc2, _ = U.run_git("C:/不存在/路径", ["log"], 5)
+        expect(rc2 is None, "仓库路径不存在 => (None,…)")
+        rc3, _ = U.run_git(local, ["log"], 5)
+        expect(rc3 == 0, "正常查询应成功（实际 %r）" % rc3)
+    finally:
+        shutil.rmtree(tmp, ignore_errors=True)
+
+
+@case("update：菜单状态行四态（fail 静默 / 最新 / 有更新 / 游离需切分支）")
+def t_update_badge_states():
+    import dsh_update as U
+    with _upd_env(os.getcwd()) as m:
+        m.write_state({"state": "fail", "why": "x"})
+        expect(m.badge() == "", "**失败必须静默**（不制造菜单噪音）")
+        m.write_state({"state": "checking"})
+        expect("检查" in m.badge(), "检查中应提示")
+        m.write_state({"state": "ok", "behind": 0, "head": "abc1234", "checked_at": m._now()})
+        b = m.badge()
+        expect("最新" in b and "abc1234" in b, "behind=0 => 显示已最新+版本：%r" % b)
+        m.write_state({"state": "ok", "behind": 12, "head": "abc1234",
+                       "upstream": "origin/master", "checked_at": m._now()})
+        b = m.badge()
+        expect("12" in b and "origin/master" in b, "落后数与基准要出现：%r" % b)
+        m.write_state({"state": "ok", "behind": 4361, "head": "a4c74a9", "detached": True,
+                       "upstream": "origin/master", "checked_at": m._now()})
+        b = m.badge()
+        expect("游离" in b and "切分支" in b, "游离 HEAD 应提示先切分支：%r" % b)
+
+
+@case("update：拉取三道闸 —— 无更新免拉 / 游离 HEAD 拒绝 / 脏工作区拒绝")
+def t_update_pull_guards():
+    import dsh_update as U
+    tmp, bare, work, local = _upd_fixture()
+    try:
+        with _upd_env(local) as m:
+            # ① 已是最新 => 免拉
+            m.write_state({"state": "ok", "behind": 0, "repo": local,
+                           "checked_at": m._now()})
+            ok, msg = m.do_pull()
+            expect(ok and "最新" in msg, "behind=0 应免拉（实际 %r,%r）" % (ok, msg))
+            # ② 游离 HEAD => 拒绝（会改 HEAD 指向）
+            _git_cmd(local, "checkout", "--detach", "HEAD")
+            m.write_state({"state": "ok", "behind": 2, "repo": local,
+                           "detached": True, "checked_at": m._now()})
+            ok, msg = m.do_pull()
+            expect(not ok and "游离" in msg, "游离 HEAD 必须拒绝（实际 %r,%r）" % (ok, msg))
+            # ③ 脏工作区 => 拒绝
+            _git_cmd(local, "checkout", "-B", "main")
+            open(os.path.join(local, "dirty.txt"), "w").write("x")
+            m.write_state({"state": "ok", "behind": 2, "repo": local, "checked_at": m._now()})
+            ok, msg = m.do_pull()
+            expect(not ok and "未提交" in msg, "脏工作区必须拒绝（实际 %r,%r）" % (ok, msg))
+    finally:
+        shutil.rmtree(tmp, ignore_errors=True)
+
+
 if __name__ == "__main__":
     # dsh-plugins.py 文件名带连字符，需用 importlib 加载
     import importlib.util

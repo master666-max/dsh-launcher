@@ -121,6 +121,56 @@ MUTANTS = [
         kill_leftover(env)""",
      """        log("  正在结束 dsh（端口 %s）..." % ", ".join(map(str, live)))
         pass"""),
+    # ===== 上游更新检查（dsh_update，2026-10-05）=====
+    # ① 免拉闸：behind==0 退回 behind<=0 ⇒ 「已是最新」会被重查成有更新并真拉
+    #    （这条是回归用例真抓到的 bug：behind<=0 分支把 0 当"状态过期"）
+    ("[update] behind=0 也当过期 → 免拉闸失效", "dsh_update.py",
+     "    if behind == 0:\n        return True, \"已是最新，无需拉取\"",
+     "    if behind <= 0:\n        pass\n    if behind == 0:\n        return True, \"已是最新，无需拉取\""),
+    # ② 节流窗口恒真 ⇒ 每次双击都打网络（违背「不重复打远端」）
+    ("[update] 节流恒真（每次启动都 fetch）", "dsh_update.py",
+     "        return (_now() - int(state.get(\"checked_at\") or 0)) < TTL_SECONDS",
+     "        return True"),
+    # ③ 失败态也被缓存一小时 ⇒ 网络抽风一次就一小时内不再检查
+    ("[update] 失败态也缓存（不再重试）", "dsh_update.py",
+     "    if state.get(\"state\") != STATE_OK:\n        return False",
+     "    pass"),
+    # ④ 游离 HEAD 不拒绝 ⇒ 拉取会改 HEAD 指向（用户丢版本位置）
+    ("[update] 游离 HEAD 不拒绝拉取", "dsh_update.py",
+     "    if detached(repo):\n        return False,",
+     "    if False:\n        return False,"),
+    # ⑤ 脏工作区闸去掉 ⇒ 半途拉取把本地改动搞冲突
+    ("[update] 脏工作区闸去掉", "dsh_update.py",
+     "    if is_dirty(repo):",
+     "    if False:"),
+    # ⑥ 查不到落后数时谎报 0（"没查过"被读成"已是最新"——本仓最恨的凭空造数）
+    ("[update] 查不到落后数谎报 0", "dsh_update.py",
+     """    try:
+        return int(out.split()[0])
+    except Exception:
+        return None""",
+     """    try:
+        return int(out.split()[0])
+    except Exception:
+        return 0"""),
+    # ⑦ badge 失败时不静默 ⇒ 菜单被"检查失败"噪音污染
+    ("[update] 失败态不静默（菜单出现噪音行）", "dsh_update.py",
+     "    if s != STATE_OK:\n        return \"\"",
+     "    if s != STATE_OK:\n        return \"  ?? 更新状态未知\""),
+    # ⑧ 超时向上抛 ⇒ 后台线程炸掉（虽然有 try，但同步路径 --update-check 会崩）
+    ("[update] 超时向上抛", "dsh_update.py",
+     """    except subprocess.TimeoutExpired:
+        return None, \"\"          # 超时：当作没查到""",
+     """    except subprocess.TimeoutExpired:
+        raise"""),
+    # ⑨ 游离 HEAD 时基准退回「无上游」⇒ 落后数永远查不到，更新检查形同虚设
+    ("[update] detached 下不退回 origin/HEAD", "dsh_update.py",
+     """    rc, out = run_git(repo, ["symbolic-ref", "--short", "refs/remotes/origin/HEAD"], QUERY_TIMEOUT)
+    if rc == 0 and out:
+        return out""",
+     """    rc, out = run_git(repo, ["symbolic-ref", "--short", "refs/remotes/origin/HEAD"], QUERY_TIMEOUT)
+    if False:
+        return out"""),
 ]
 
 caught = missed = skipped = 0

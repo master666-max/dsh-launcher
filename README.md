@@ -13,7 +13,7 @@
 | 🛡️ **安全模式启动** | 插件把 dsh 搞挂时的最小集逃生门 —— 只禁外部插件、内置不动、字节级备份、一键还原 |
 | 🔁 **一键重启** | 结束实例 → 等端口真释放 → 走完整启动流程（防脏锁） |
 | 🔍 **运行时探测** | 仓库 / profile / 端口 / 启动命令全探测，零硬编码路径，目录随意搬 |
-| 🧪 **变异测试** | 21 个故意改坏的关键逻辑点，验证回归用例「真能抓到」而非只在干净代码上全绿 |
+| 🧪 **变异测试** | 30 个故意改坏的关键逻辑点，验证回归用例「真能抓到」而非只在干净代码上全绿 |
 | 🩺 **六类故障速查** | 启动失败按层排查（PATH 抢占 → 端口排除范围），方法论沉淀在 [MAINTENANCE.md](MAINTENANCE.md) |
 
 ---
@@ -57,8 +57,17 @@ git clone https://github.com/master666-max/dsh-launcher.git "%USERPROFILE%\dsh-l
 [6] 安全模式启动（禁用全部外部插件）
 [7] 恢复正式模式（还原安全模式禁掉的插件）
 [8] 重启 dsh（结束现有实例再启动）
+[9] 检查并拉取 dsh 更新（只快进，不自动重启）
 [0] 退出
 ```
+
+> **[9] 上游更新（2026-10-05）**：启动器在**后台线程**查一次「本机 dsh 仓库落后
+> 上游几个提交」，菜单顶部显示一行状态（`√ 已是最新` / `⬆ 落后 N 个提交`）。
+> **检查绝不阻碍启动**：后台 daemon 线程 + 每条 git 命令有超时 + 失败静默 +
+> 一小时节流。实测首屏 3.09s vs 改动前 3.18s（噪声内）。
+> 拉取只由人点 [9] 触发，且过三道闸（无更新免拉 / 游离 HEAD 拒绝 / 脏工作区拒绝），
+> 只 `git pull --ff-only` 不产生合并提交，**拉完不自动重启**（重启用 [8]）。
+> 命令行也可用：`python dsh-launcher.py --update-check`（只查不拉，给脚本看）。
 
 > [6]/[7] 类比 Windows 安全模式：某个外部插件把 dsh 搞挂时，[6] 仍能以最小插件集进系统排查。
 > 进入前必须拿到权威插件树（入口 id ≠ 包名，拿不到就拒绝，绝不假安全）；
@@ -76,10 +85,11 @@ git clone https://github.com/master666-max/dsh-launcher.git "%USERPROFILE%\dsh-l
 | `dsh-launcher.py` | 编排 + 交互菜单。**不含任何 dsh 内部知识** |
 | `dsh-plugins.py` | 插件管理：列出全部入口、冲突检查、启用/禁用（写 profile 补丁） |
 | `dsh-fallback-heal.py` | 补齐 `.dsh-module-fallback` 缺失 junction |
-| `dsh_tests.py` | **回归测试（43 用例）**，写操作全在临时副本上 |
+| `dsh_update.py` | **上游更新检查**：后台查落后提交数（只读 git）、菜单状态行、`[9]` 快进拉取（三道闸）。所有 git 失败都静默 |
+| `dsh_tests.py` | **回归测试（51 用例）**，写操作全在临时副本上（更新检查的样本是**真 git 仓库**：bare origin + clone + 真提交） |
 | `dsh-selfcheck.py` | 静态自检：语法 / 缺失 import / 未定义名 / GBK 字符 / subprocess 参数名 / bat 行尾 / 解耦（关键词黑名单 + **绝对路径白名单**） |
-| `dsh-accept.py` | **一键验收**：静态自检 + 43 回归用例 + bat 语法闸 + 解释器探测 + 行尾检查 |
-| `dsh-mutate.py` | **变异测试**：故意改坏 21 处关键逻辑，验证回归用例真能抓到 |
+| `dsh-accept.py` | **一键验收**：静态自检 + 51 回归用例 + bat 语法闸 + 解释器探测 + 行尾检查 |
+| `dsh-mutate.py` | **变异测试**：故意改坏 30 处关键逻辑，验证回归用例真能抓到 |
 | `dsh-env.py` | 命令行薄壳（`--dump` / `--refresh` / `--json`） |
 | `start-dsh.bat` | **启动入口**（复制到桌面用）。薄壳：定位工具链目录 + PATH 钉扎 + 转交 `dsh-launcher.py` |
 | `结束-dsh.bat` | **停止脚本**（复制到桌面用）。netstat+taskkill 结束占用 3080 的进程 |
@@ -93,7 +103,7 @@ python dsh-accept.py         :: 【推荐】一键跑齐下面三段 + 解释器
 分步跑也可以：
 ```bat
 python dsh-selfcheck.py      :: 静态自检，0 问题才算完
-python dsh_tests.py          :: 43 用例回归，全过才算完
+python dsh_tests.py          :: 51 用例回归，全过才算完
 python dsh-env.py --refresh  :: dsh 升级或换目录后强制重探
 ```
 
