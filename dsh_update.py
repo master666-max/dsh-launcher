@@ -163,6 +163,22 @@ def upstream_ref(repo):
     return "origin/master" if rc == 0 and out else ""
 
 
+def upstream_remote_branch(repo):
+    """把 upstream_ref() 拆成 (remote, branch)，给 `git pull <remote> <branch>` 用。
+
+    [!] `git checkout -b X` 建出来的本地分支**没有 upstream**（实测 2026-10-09：
+        `fatal: no upstream configured`），裸 `git pull` 会直接报
+        "There is no tracking information for the current branch" —— 光按提示
+        建分支根本拉不动。显式给 remote/branch 才走得通。
+    拿不到基准 => ("", "")，调用方退回裸 pull（注定失败，但错误信息归 git 说）。
+    """
+    u = upstream_ref(repo)
+    if not u or "/" not in u:
+        return "", ""
+    remote, branch = u.split("/", 1)
+    return remote, branch
+
+
 def _parse_count(out):
     """把 `git rev-list --count` 的输出解析成 int。**解析不了 => None**（不是 0）。
 
@@ -228,8 +244,15 @@ def upstream_subject(repo):
 
 
 def is_dirty(repo):
-    """工作区有未提交改动吗（拉取前的安全闸）。"""
-    rc, out = run_git(repo, ["status", "--porcelain"], QUERY_TIMEOUT)
+    """工作区有**已跟踪文件**的未提交改动吗（拉取/回退前的安全闸）。
+
+    [!] 只看已跟踪文件（--untracked-files=no）。未跟踪的草稿/数据文件
+        不会因 ff-only 拉取而丢失（真撞上同名路径，git 自己会拒绝覆盖、
+        而不是默默覆盖），但把它们也算脏的话，本机常年躺着的
+        _draft_*.json / data/ 会让**更新闸门永远关着**：
+        2026-10-09 实测 8 个 untracked 条目 => do_pull 恒拒绝。
+    """
+    rc, out = run_git(repo, ["status", "--porcelain", "--untracked-files=no"], QUERY_TIMEOUT)
     if rc != 0:
         return False
     return bool(out)
@@ -330,17 +353,30 @@ def do_pull():
         return True, "已是最新，无需拉取"
     if detached(repo):
         return False, ("当前是游离 HEAD（detached），拉取会改动 HEAD 指向 —— 已拒绝。"
-                       "请先 git checkout -b 本地分支（或 git checkout main），再回来拉取")
+                       "先建一个本地分支站上去（留在现在的提交上），再回来拉：\n"
+                       "         git checkout -b main\n"
+                       "     （建完本工具会按上游默认分支比对/拉取，不用手动配 upstream）")
     if is_dirty(repo):
-        return False, ("工作区有未提交改动（%d 项），已拒绝拉取 —— "
-                       "先 commit 或 stash 再试" % len(run_git(repo, ["status", "--porcelain"], QUERY_TIMEOUT)[1].splitlines()))
+        n = len(run_git(repo, ["status", "--porcelain", "--untracked-files=no"],
+                        QUERY_TIMEOUT)[1].splitlines())
+        return False, ("工作区有未提交改动（%d 项，只算已跟踪文件），已拒绝拉取 —— "
+                       "先 commit 或 stash 再试" % n)
     # [!] **先记住"从哪来"** —— 更新后要是不满意，回退就靠这条记录。
     #     必须**在 pull 之前**取（pull 后 HEAD 已变）；记在状态文件里，
     #     不动仓库（不打 tag、不建分支、不碰用户的 git 状态）。
     prev_full = head_full(repo)
-    rc, out = run_git(repo, ["pull", "--ff-only", "--quiet"], FETCH_TIMEOUT)
+    # 显式 remote/branch：无 upstream 的本地分支（checkout -b 的常态）上，
+    # 裸 `git pull` 报 "no tracking information"，永远拉不动（2026-10-09 实测）。
+    remote, branch = upstream_remote_branch(repo)
+    if remote and branch:
+        rc, out = run_git(repo, ["pull", "--ff-only", "--quiet", remote, branch], FETCH_TIMEOUT)
+    else:
+        rc, out = run_git(repo, ["pull", "--ff-only", "--quiet"], FETCH_TIMEOUT)
     if rc != 0:
-        return False, "拉取失败：%s" % (out or "git pull 返回 %s" % rc)
+        hint = ""
+        if "untracked working tree files would be overwritten" in (out or ""):
+            hint = "（有未跟踪文件与要拉入的文件同名冲突 —— 先挪走/改名那个文件再试）"
+        return False, "拉取失败：%s%s" % (out or "git pull 返回 %s" % rc, hint)
     new_head = head_short(repo)
     new_full = head_full(repo)
     st = {"state": STATE_OK, "checked_at": _now(), "behind": 0,

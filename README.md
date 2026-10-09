@@ -13,7 +13,7 @@
 | 🛡️ **安全模式启动** | 插件把 dsh 搞挂时的最小集逃生门 —— 只禁外部插件、内置不动、字节级备份、一键还原 |
 | 🔁 **一键重启** | 结束实例 → 等端口真释放 → 走完整启动流程（防脏锁） |
 | 🔍 **运行时探测** | 仓库 / profile / 端口 / 启动命令全探测，零硬编码路径，目录随意搬 |
-| 🧪 **变异测试** | 30 个故意改坏的关键逻辑点，验证回归用例「真能抓到」而非只在干净代码上全绿 |
+| 🧪 **变异测试** | 33 个故意改坏的关键逻辑点，验证回归用例「真能抓到」而非只在干净代码上全绿 |
 | 🩺 **六类故障速查** | 启动失败按层排查（PATH 抢占 → 端口排除范围），方法论沉淀在 [MAINTENANCE.md](MAINTENANCE.md) |
 
 ---
@@ -57,7 +57,7 @@ git clone https://github.com/master666-max/dsh-launcher.git "%USERPROFILE%\dsh-l
 [6] 安全模式启动（禁用全部外部插件）
 [7] 恢复正式模式（还原安全模式禁掉的插件）
 [8] 重启 dsh（结束现有实例再启动）
-[9] 检查并拉取 dsh 更新（只快进，不自动重启）
+[9] 检查并拉取 dsh 更新（只快进，不自动重启，不合适可回退）
 [0] 退出
 ```
 
@@ -67,15 +67,26 @@ git clone https://github.com/master666-max/dsh-launcher.git "%USERPROFILE%\dsh-l
 > 一小时节流。实测首屏 3.09s vs 改动前 3.18s（噪声内）。
 > 拉取只由人点 [9] 触发，且过三道闸（无更新免拉 / 游离 HEAD 拒绝 / 脏工作区拒绝），
 > 只 `git pull --ff-only` 不产生合并提交，**拉完不自动重启**（重启用 [8]）。
-> 命令行也可用：`python dsh-launcher.py --update-check`（只查不拉，给脚本看）。
+> 命令行可用：`python dsh-launcher.py --update-check`（只查不拉）；
+> **`--update`（执行更新，同 [9]，`--yes` 跳过确认）**（2026-10-09 加）。
 >
 > **更新不合适 ⇒ 回退**（2026-10-09）：每次拉取**前**都会把当时的 commit 记进
-> 状态文件（不打 tag、不建分支、不碰你的 git 状态）。菜单 [9] 在「已是最新 / 取消 /
-> 拉取失败」三个出口都会问一句「要回退吗」；命令行也能直接回退：
+> 状态文件（不打 tag、不建分支、不碰你的 git 状态）。菜单 [9] 在「已是最新 /
+> 拉取成功 / 拉取失败」出口都会问一句「要回退吗」；命令行也能直接回退：
 > `python dsh-launcher.py --update-rollback`（`--yes` 跳过确认）。
 > 回退用 `git checkout --detach <sha>` —— **不改动任何分支的历史**，出问题还能再切回来；
 > 工作区脏或那个 commit 已不在仓库（被 gc）都会被拒绝并说明原因。
 > 回退同样**不自动重启**（重启用 [8]）。
+>
+> **2026-10-09 三个实测修复**：
+> 1. `_offer_rollback` 是**死代码**（写好了从没被调用）—— 已接到 [9] 的出口上；
+> 2. 游离 HEAD 的拒绝提示原来让用户 `git checkout -b 本地分支`，但那样建的分支
+>    **没有 upstream**，裸 `git pull` 报 "no tracking information" —— 现在
+>    do_pull 显式 `git pull --ff-only <remote> <branch>`，按提示建完分支就能拉；
+> 3. **未跟踪文件不再算"脏"**：仓库里常年的草稿文件（`_draft_*.json` 等）曾把
+>    更新闸门永久关死（ff-only 拉取不会动未跟踪文件，真同名冲突 git 自己会拒绝）；
+> 4. **确认方向修复**：update 流程原来用 `if not ask(...)`，用户明确输入
+>    `n` 反而会继续执行 —— 现统一为 `confirm()`（只有 y 才继续）。
 
 > [6]/[7] 类比 Windows 安全模式：某个外部插件把 dsh 搞挂时，[6] 仍能以最小插件集进系统排查。
 > 进入前必须拿到权威插件树（入口 id ≠ 包名，拿不到就拒绝，绝不假安全）；
@@ -94,10 +105,10 @@ git clone https://github.com/master666-max/dsh-launcher.git "%USERPROFILE%\dsh-l
 | `dsh-plugins.py` | 插件管理：列出全部入口、冲突检查、启用/禁用（写 profile 补丁） |
 | `dsh-fallback-heal.py` | 补齐 `.dsh-module-fallback` 缺失 junction |
 | `dsh_update.py` | **上游更新检查**：后台查落后提交数（只读 git）、菜单状态行、`[9]` 快进拉取（三道闸）。所有 git 失败都静默 |
-| `dsh_tests.py` | **回归测试（55 用例）**，写操作全在临时副本上（更新检查的样本是**真 git 仓库**：bare origin + clone + 真提交） |
+| `dsh_tests.py` | **回归测试（58 用例）**，写操作全在临时副本上（更新检查的样本是**真 git 仓库**：bare origin + clone + 真提交） |
 | `dsh-selfcheck.py` | 静态自检：语法 / 缺失 import / 未定义名 / GBK 字符 / subprocess 参数名 / bat 行尾 / 解耦（关键词黑名单 + **绝对路径白名单**） |
-| `dsh-accept.py` | **一键验收**：静态自检 + 55 回归用例 + bat 语法闸 + 解释器探测 + 行尾检查 |
-| `dsh-mutate.py` | **变异测试**：故意改坏 30 处关键逻辑，验证回归用例真能抓到 |
+| `dsh-accept.py` | **一键验收**：静态自检 + 58 回归用例 + bat 语法闸 + 解释器探测 + 行尾检查 |
+| `dsh-mutate.py` | **变异测试**：故意改坏 33 处关键逻辑，验证回归用例真能抓到 |
 | `dsh-env.py` | 命令行薄壳（`--dump` / `--refresh` / `--json`） |
 | `start-dsh.bat` | **启动入口**（复制到桌面用）。薄壳：定位工具链目录 + PATH 钉扎 + 转交 `dsh-launcher.py` |
 | `结束-dsh.bat` | **停止脚本**（复制到桌面用）。netstat+taskkill 结束占用 3080 的进程 |
@@ -111,7 +122,7 @@ python dsh-accept.py         :: 【推荐】一键跑齐下面三段 + 解释器
 分步跑也可以：
 ```bat
 python dsh-selfcheck.py      :: 静态自检，0 问题才算完
-python dsh_tests.py          :: 55 用例回归，全过才算完
+python dsh_tests.py          :: 58 用例回归，全过才算完
 python dsh-env.py --refresh  :: dsh 升级或换目录后强制重探
 ```
 

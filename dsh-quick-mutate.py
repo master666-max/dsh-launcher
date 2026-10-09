@@ -8,9 +8,11 @@
     那一条用例（验证力等价，快一个数量级）。
 [!] 跑它之前先确认没有别的变异进程在跑：后台还原会覆盖并行的手工修复。
 
-用法：python _quick_mutate.py
+用法：python dsh-quick-mutate.py
 原理与 dsh-mutate.py 相同（改锚点 → 相关用例必须失败 → 还原），
 只是把「跑全量」换成「跑该变异对应的那一条」，快一个数量级。
+[2026-10-09] 支持多文件变异（每条带 fname）—— 回退接线的变异在
+    dsh-launcher.py 里，单文件版够不着。
 """
 import importlib.util
 import io
@@ -19,36 +21,49 @@ import sys
 import contextlib
 
 T = os.path.dirname(os.path.abspath(__file__))
-U = os.path.join(T, "dsh_update.py")
 
+# (描述, 文件名, 用例名, 锚点, 变异体)
 MUT = [
-    ("behind=0 也当过期 -> 免拉闸失效", "t_update_pull_guards",
+    ("behind=0 也当过期 -> 免拉闸失效", "dsh_update.py", "t_update_pull_guards",
      '    if behind == 0:\n        return True, "已是最新，无需拉取"',
      '    if behind <= 0:\n        behind = behind_count(repo)'),
-    ("节流恒真（每次启动都 fetch）", "t_update_throttle",
+    ("节流恒真（每次启动都 fetch）", "dsh_update.py", "t_update_throttle",
      '        return (_now() - int(state.get("checked_at") or 0)) < TTL_SECONDS',
      '        return True'),
-    ("失败态也缓存（不再重试）", "t_update_throttle",
+    ("失败态也缓存（不再重试）", "dsh_update.py", "t_update_throttle",
      '    if state.get("state") != STATE_OK:\n        return False',
      '    pass'),
-    ("游离 HEAD 不拒绝拉取", "t_update_pull_guards",
+    ("游离 HEAD 不拒绝拉取", "dsh_update.py", "t_update_pull_guards",
      '    if detached(repo):\n        return False,',
      '    if False:\n        return False,'),
-    ("脏工作区闸去掉", "t_update_pull_guards",
+    ("脏工作区闸去掉", "dsh_update.py", "t_update_pull_guards",
      '    if is_dirty(repo):',
      '    if False:'),
-    ("查不到落后数谎报 0", "t_update_no_upstream",
-     '    try:\n        return int(out.split()[0])\n    except Exception:\n        return None',
-     '    try:\n        return int(out.split()[0])\n    except Exception:\n        return 0'),
-    ("失败态不静默（菜单噪音）", "t_update_badge_states",
+    ("查不到落后数谎报 0", "dsh_update.py", "t_update_parse_count",
+     '    try:\n        return int(s.split()[0])\n    except Exception:\n        return None',
+     '    try:\n        return int(s.split()[0])\n    except Exception:\n        return 0'),
+    ("失败态不静默（菜单噪音）", "dsh_update.py", "t_update_badge_states",
      '    if s != STATE_OK:\n        return ""',
      '    if s != STATE_OK:\n        return "  ?? 更新状态未知"'),
-    ("超时向上抛", "t_update_timeout_no_raise",
+    ("超时向上抛", "dsh_update.py", "t_update_timeout_no_raise",
      '    except subprocess.TimeoutExpired:\n        return None, ""',
      '    except subprocess.TimeoutExpired:\n        raise'),
-    ("detached 下不退回 origin/HEAD", "t_update_detached",
+    ("detached 下不退回 origin/HEAD", "dsh_update.py", "t_update_detached",
      '    rc, out = run_git(repo, ["symbolic-ref", "--short", "refs/remotes/origin/HEAD"], QUERY_TIMEOUT)\n    if rc == 0 and out:\n        return out',
      '    rc, out = run_git(repo, ["symbolic-ref", "--short", "refs/remotes/origin/HEAD"], QUERY_TIMEOUT)\n    if False:\n        return out'),
+    # ---- 2026-10-09 新增：三处实测修复的守护 ----
+    ("untracked 也算脏（草稿文件挡更新）", "dsh_update.py", "t_update_untracked_not_dirty",
+     '    rc, out = run_git(repo, ["status", "--porcelain", "--untracked-files=no"], QUERY_TIMEOUT)\n    if rc != 0:\n        return False\n    return bool(out)',
+     '    rc, out = run_git(repo, ["status", "--porcelain"], QUERY_TIMEOUT)\n    if rc != 0:\n        return False\n    return bool(out)'),
+    ("无 upstream 时退回裸 pull（拉不动）", "dsh_update.py", "t_update_pull_no_upstream",
+     '    remote, branch = upstream_remote_branch(repo)\n    if remote and branch:\n        rc, out = run_git(repo, ["pull", "--ff-only", "--quiet", remote, branch], FETCH_TIMEOUT)\n    else:\n        rc, out = run_git(repo, ["pull", "--ff-only", "--quiet"], FETCH_TIMEOUT)',
+     '    rc, out = run_git(repo, ["pull", "--ff-only", "--quiet"], FETCH_TIMEOUT)'),
+    ("_offer_rollback 又断线（回退入口消失）", "dsh-launcher.py", "t_update_cli_update",
+     "    _offer_rollback()                         # 拉完/拉失败都给一次退路（默认 N，不扰）",
+     "    pass  # 拉完/拉失败都给一次退路（默认 N，不扰）"),
+    ("confirm 方向反掉（输入 n 变成继续）", "dsh-launcher.py", "t_update_cli_update",
+     '        log("  （--yes：自动确认）%s" % msg.strip())\n        return True\n    return ask(msg).strip().lower() == "y"',
+     '        log("  （--yes：自动确认）%s" % msg.strip())\n        return True\n    return not ask(msg)'),
 ]
 
 
@@ -80,14 +95,23 @@ def run_case(fn, mod):
 
 def main():
     tests = load_tests()
-    src0 = open(U, "r", encoding="utf-8").read()
+    # 每个文件读一次原文（还原用）；只 write 不 delete
+    files = sorted(set(f for _, f, _, _, _ in MUT))
+    src0 = {}
+    for f in files:
+        p = os.path.join(T, f)
+        if os.path.exists(p):
+            src0[f] = open(p, "r", encoding="utf-8").read()
     caught, missed, broken = 0, [], []
-    for desc, case_name, anchor, mutant in MUT:
-        if anchor not in src0:
+    for desc, fname, case_name, anchor, mutant in MUT:
+        if fname not in src0:
+            broken.append((desc, "无文件 %s" % fname))
+            continue
+        if anchor not in src0[fname]:
             broken.append((desc, "锚点失配"))
             continue
-        with open(U, "w", encoding="utf-8", newline="") as f:
-            f.write(src0.replace(anchor, mutant, 1))
+        with open(os.path.join(T, fname), "w", encoding="utf-8", newline="") as f:
+            f.write(src0[fname].replace(anchor, mutant, 1))
         try:
             for m in list(sys.modules):
                 if m == "dsh_update":
@@ -99,13 +123,13 @@ def main():
             failed, why = run_case(fn, tests)
             if failed:
                 caught += 1
-                print("  [抓到了] %-34s <- %s" % (desc, case_name))
+                print("  [抓到了] %-36s <- %s" % (desc, case_name))
             else:
                 missed.append(desc)
-                print("  [漏了！] %-34s <- %s" % (desc, case_name))
+                print("  [漏了！] %-36s <- %s" % (desc, case_name))
         finally:
-            with open(U, "w", encoding="utf-8", newline="") as f:
-                f.write(src0)
+            with open(os.path.join(T, fname), "w", encoding="utf-8", newline="") as f:
+                f.write(src0[fname])
             sys.modules.pop("dsh_update", None)
     print()
     print("变异 %d 条：抓到 %d，漏 %d，异常 %d" % (len(MUT), caught, len(missed), len(broken)))

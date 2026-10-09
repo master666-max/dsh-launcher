@@ -61,6 +61,20 @@ def ask(msg):
         return ""
 
 
+def confirm(msg, assume_yes=False):
+    """[y/N] 确认：**只有明确输入 y 才 True**（回车/n/EOF 一律 No）。
+
+    [!] 2026-10-09 修：update 流程原来写的是 `if not ask(...)` ——
+        not "n" 是 False，用户明确输入 n 反而会**继续执行**；
+        只有空回车才取消。确认方向反了（此 bug 让"n"变成"是"）。
+        现与 action_start 内 confirm()（ask(...).strip().lower()=="y"）对齐。
+    """
+    if assume_yes:
+        log("  （--yes：自动确认）%s" % msg.strip())
+        return True
+    return ask(msg).strip().lower() == "y"
+
+
 def line(c="-"):
     log(c * 66)
 
@@ -526,7 +540,7 @@ def _offer_rollback():
     if not ok:
         log("  （%s）" % info)
         return True
-    if not ask("  要回退到它吗？（工作区有未提交改动会被拒绝）[y/N] > "):
+    if not confirm("  要回退到它吗？（工作区有未提交改动会被拒绝）[y/N] > "):
         log("  已取消（dsh 不受影响）。")
         return True
     ok2, msg = dsh_update.do_rollback()
@@ -536,13 +550,25 @@ def _offer_rollback():
     return True
 
 
-def action_update():
+def action_update(assume_yes=False, from_cli=False):
     """[9] 检查并拉取 dsh 上游更新（**由人触发**，后台检查只负责提示）。
 
     拉取的三道闸都在 dsh_update.do_pull 里：落后为 0 不拉、工作区脏不拉、
     游离 HEAD 不拉（会改 HEAD 指向）；只 --ff-only，不产生合并提交。
     **拉完不自动重启** —— 重启是人的决定（[8]）。
+
+    from_cli=True（命令行 `--update`）：不 pause，直接返回退出码 0/1；
+    assume_yes=True（`--yes`）：跳过确认（脚本用）。
+
+    [!] 各出口接 _offer_rollback()：这函数 2026-10-07 写好却**从没被调用**
+        （死代码），菜单里"更新完能顺手回退"的承诺一直没兑现 ——
+        2026-10-09 修。只在有回退记录时才有话说，没记录则静默。
     """
+    def _done(rc=0):
+        if not from_cli:
+            pause()
+        return rc
+
     line("=")
     log("  dsh 更新")
     line("=")
@@ -550,15 +576,13 @@ def action_update():
         import dsh_update
     except Exception as e:
         log("  更新模块不可用：%s" % e)
-        pause()
-        return
+        return _done(1)
 
     st = dsh_update.do_check(force=True)      # 人点了 => 允许重新查（绕过节流）
     if st.get("state") != dsh_update.STATE_OK:
         log("  检查失败：%s" % (st.get("why") or "未知原因"))
         log("  （不影响启动：dsh 照常可用）")
-        pause()
-        return
+        return _done(1)
 
     behind = st.get("behind", 0)
     log("  当前 HEAD：%s" % (st.get("head") or "?"))
@@ -569,19 +593,19 @@ def action_update():
         log("  上游最新：%s" % st["subject"])
     if behind <= 0:
         log("  √ 已是最新")
-        pause()
-        return
+        _offer_rollback()                     # 用户往往是"上次更新不合适"才回来点的
+        return _done()
 
-    if not ask("  拉取这 %d 个提交？只快进，不合并 [y/N] > "):
+    if not confirm("  拉取这 %d 个提交？只快进，不合并 [y/N] > " % behind, assume_yes=assume_yes):
         log("  已取消（dsh 不受影响）。")
-        pause()
-        return
+        return _done()
 
     ok, msg = dsh_update.do_pull()
     log(("  √ " if ok else "  × ") + msg)
     if ok:
         log("  提示：源码已更新，**需要重启 dsh 才生效** —— 菜单 [8] 重启 dsh")
-    pause()
+    _offer_rollback()                         # 拉完/拉失败都给一次退路（默认 N，不扰）
+    return _done(0 if ok else 1)
 
 
 def action_restart():
@@ -842,7 +866,7 @@ MENU = """
   [6] 安全模式启动 —— 只留内置插件（dsh 起不来时的救命模式）
   [7] 恢复正式模式 —— 还原安全模式禁用的插件
   [8] 重启 dsh —— 结束现有实例再启动
-  [9] 检查并拉取 dsh 更新 —— 只快进，不自动重启
+  [9] 检查并拉取 dsh 更新 —— 只快进，不自动重启（不合适可回退）
 
   [0] 退出
 """
@@ -930,7 +954,7 @@ def main():
                 log("  不用回退：%s" % info0)
                 return 0
             log("  即将回退到：%s" % dsh_update.rollback_target()[:9])
-            if "--yes" not in argv and not ask("  确认回退？[y/N] > "):
+            if not confirm("  确认回退？[y/N] > ", assume_yes="--yes" in argv):
                 log("  已取消。")
                 return 0
             ok, msg = dsh_update.do_rollback()
@@ -948,6 +972,15 @@ def main():
         except Exception as e:
             log("  检查更新失败：%s" % e)
         return 0
+    if "--update" in argv:
+        # 命令行执行更新（不启动 dsh、不进菜单）。与菜单 [9] 同一套逻辑：
+        # 三道闸 + 只快进；--yes 跳过确认（脚本用，无 --yes 时走交互确认）。
+        # 退出码：0 = 已更新/已是最新/用户取消，1 = 检查失败或拉取失败。
+        try:
+            return action_update(assume_yes="--yes" in argv, from_cli=True)
+        except Exception as e:
+            log("  更新失败：%s" % e)
+            return 1
 
     # ---- 首屏：1 秒窗口 ----
     if "--menu" not in argv:

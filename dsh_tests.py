@@ -1647,18 +1647,139 @@ def t_update_pull_guards():
                            "checked_at": m._now()})
             ok, msg = m.do_pull()
             expect(ok and "最新" in msg, "behind=0 应免拉（实际 %r,%r）" % (ok, msg))
-            # ② 游离 HEAD => 拒绝（会改 HEAD 指向）
+            # ② 游离 HEAD => 拒绝（会改 HEAD 指向），且必须给出**具体可执行**
+            #    的出路 —— 光说"请先建分支"没用：checkout -b 建的分支没有
+            #    upstream，裸 pull 依旧拉不动（2026-10-09 实测）。
             _git_cmd(local, "checkout", "--detach", "HEAD")
             m.write_state({"state": "ok", "behind": 2, "repo": local,
                            "detached": True, "checked_at": m._now()})
             ok, msg = m.do_pull()
             expect(not ok and "游离" in msg, "游离 HEAD 必须拒绝（实际 %r,%r）" % (ok, msg))
-            # ③ 脏工作区 => 拒绝
+            expect("git checkout -b" in msg,
+                   "拒绝时必须给出可直接照着敲的建分支命令（实际 %r）" % msg)
+            # ③ 脏工作区 => 拒绝。**必须改已跟踪文件** —— 未跟踪草稿文件
+            #    现在被有意排除在"脏"之外（见 untracked 专用用例）。
             _git_cmd(local, "checkout", "-B", "main")
-            open(os.path.join(local, "dirty.txt"), "w").write("x")
+            open(os.path.join(local, "a.txt"), "w").write("dirty-tracked")
             m.write_state({"state": "ok", "behind": 2, "repo": local, "checked_at": m._now()})
             ok, msg = m.do_pull()
             expect(not ok and "未提交" in msg, "脏工作区必须拒绝（实际 %r,%r）" % (ok, msg))
+    finally:
+        shutil.rmtree(tmp, ignore_errors=True)
+
+
+@case("update：未跟踪草稿文件不算脏（否则更新闸门永远关着）")
+def t_update_untracked_not_dirty():
+    import dsh_update as U
+    tmp, bare, work, local = _upd_fixture()
+    try:
+        with _upd_env(local) as m:
+            # 本机真实形态：仓库里常年躺着 8 个未跟踪草稿/数据文件
+            # （_draft_*.json / data/ / tmp_inputs.md）。
+            # 2026-10-09 实测：把它们算脏 => do_pull 恒拒绝，更新没法做。
+            open(os.path.join(local, "draft-note.json"), "w").write("x")
+            os.makedirs(os.path.join(local, "data"), exist_ok=True)
+            open(os.path.join(local, "data", "blob.bin"), "w").write("y")
+            expect(U.is_dirty(local) is False,
+                   "只有未跟踪文件时 is_dirty 应为 False（实测 %r）" % U.is_dirty(local))
+            before = U.head_full(local)
+            m.write_state({"state": "ok", "behind": 2, "repo": local, "checked_at": m._now()})
+            ok, msg = m.do_pull()
+            expect(ok, "未跟踪文件不该挡住拉取（实际 %r,%r）" % (ok, msg))
+            expect(U.head_full(local) != before, "拉取后 HEAD 应前移")
+            expect(os.path.exists(os.path.join(local, "draft-note.json")),
+                   "未跟踪草稿文件拉取后必须原样保留")
+            expect(os.path.exists(os.path.join(local, "data", "blob.bin")),
+                   "未跟踪目录内容拉取后必须原样保留")
+    finally:
+        shutil.rmtree(tmp, ignore_errors=True)
+
+
+@case("update：无 upstream 的本地分支也能拉（checkout -b 之后的真实形态）")
+def t_update_pull_no_upstream():
+    import dsh_update as U
+    tmp, bare, work, local = _upd_fixture()
+    try:
+        with _upd_env(local) as m:
+            # 模拟用户按提示做了 `git checkout -b mywork` 之后：
+            # HEAD 不再游离 ✓，但这个分支**没有 upstream** ——
+            # 裸 `git pull` 会报 "no tracking information"（2026-10-09 实测）。
+            _git_cmd(local, "checkout", "-b", "mywork")
+            rc, _out = U.run_git(local, ["rev-parse", "--abbrev-ref",
+                                         "--symbolic-full-name", "@{u}"], 20)
+            expect(rc != 0, "前提校验：mywork 确实不该有 upstream")
+            expect(U.detached(local) is False, "前提校验：建完分支不该再游离")
+            before = U.head_full(local)
+            m.write_state({"state": "ok", "behind": 2, "repo": local, "checked_at": m._now()})
+            ok, msg = m.do_pull()
+            expect(ok, "无 upstream 分支也必须能拉（实际 %r,%r）" % (ok, msg))
+            expect(U.head_full(local) != before, "拉取后 HEAD 应前移")
+    finally:
+        shutil.rmtree(tmp, ignore_errors=True)
+
+
+@case("update：--update CLI 路径（from_cli 不 pause、返回退出码、且接上回退出口）")
+def t_update_cli_update():
+    import importlib.util as _ilu
+    _s = _ilu.spec_from_file_location('dsh_launcher_upd',
+                                      os.path.join(T, 'dsh-launcher.py'))
+    L = _ilu.module_from_spec(_s)
+    _s.loader.exec_module(L)
+    tmp, bare, work, local = _upd_fixture()
+    try:
+        with _upd_env(local) as m:
+            # 静音输出 + 拦截 pause：from_cli 不该 pause（挡住会卡测试）
+            real_log, real_line, real_pause = L.log, L.line, L.pause
+            pauses = []
+            L.log = lambda *a, **k: None
+            L.line = lambda *a, **k: None
+            L.pause = lambda *a, **k: pauses.append(1)
+            # 记录 _offer_rollback 是否被接上（守护"死代码"回归）
+            roll_calls = []
+            real_roll = L._offer_rollback
+            L._offer_rollback = lambda: (roll_calls.append(1), False)[1]
+            try:
+                # ① 空回车（EOF 同理）必须取消 —— 守护 confirm 方向：旧的
+                #    `not ask(...)` 写法里 not "" 是 True，空回车反而会**继续拉**；
+                #    同理也抓 confirm 体内 `return not ask(msg)` 的反向变异。
+                before0 = m.head_full(local)
+                m.write_state({"state": "ok", "behind": 2, "repo": local, "checked_at": m._now()})
+                real_ask = L.ask
+                L.ask = lambda *a, **k: ""
+                try:
+                    rc = L.action_update(assume_yes=False, from_cli=True)
+                finally:
+                    L.ask = real_ask
+                expect(rc == 0, "取消路径退出码应为 0（实际 %r）" % rc)
+                expect(m.head_full(local) == before0,
+                       "空回车不该动 HEAD（confirm 方向守护，实际动了！）")
+                lp0 = m.read_state().get("last_pull")
+                expect(not lp0, "取消路径不该记回退锚点（实际 %r）" % lp0)
+
+                # ①b 明确输入 "n" 也必须取消（防御纵深：老调用点写法
+                #    `if not ask(...)` 会把 "n" 当成"继续"）
+                L.ask = lambda *a, **k: "n"
+                try:
+                    rc = L.action_update(assume_yes=False, from_cli=True)
+                finally:
+                    L.ask = real_ask
+                expect(rc == 0, "输入 n 的取消路径退出码应为 0（实际 %r）" % rc)
+                expect(m.head_full(local) == before0,
+                       "输入 n 后 HEAD 不该动（实际动了！）")
+
+                # ② 有落后 + --yes => 真拉，退出码 0
+                before = m.head_full(local)
+                m.write_state({"state": "ok", "behind": 2, "repo": local, "checked_at": m._now()})
+                rc = L.action_update(assume_yes=True, from_cli=True)
+                expect(rc == 0, "拉取成功退出码应为 0（实际 %r）" % rc)
+                expect(m.head_full(local) != before, "CLI 路径应真的把更新拉下来")
+                expect(not pauses, "from_cli=True 不该 pause（实际 %d 次）" % len(pauses))
+                expect(roll_calls, "更新流程必须接上 _offer_rollback（死代码回归者抓）")
+                lp = m.read_state().get("last_pull") or {}
+                expect(lp.get("from") == before, "CLI 拉取也要记回退锚点（实际 %r）" % lp.get("from"))
+            finally:
+                L.log, L.line, L.pause = real_log, real_line, real_pause
+                L._offer_rollback = real_roll
     finally:
         shutil.rmtree(tmp, ignore_errors=True)
 
@@ -1734,11 +1855,12 @@ def t_update_rollback_guards():
                            "checked_at": m._now()})
             ok, msg = m.do_rollback()
             expect(not ok and "不在仓库" in msg, "sha 不存在应拒绝（实际 %r,%r）" % (ok, msg))
-            # ③ 脏工作区
+            # ③ 脏工作区（**已跟踪**文件被改 —— 未跟踪草稿文件有意不算脏，
+            #    见 update 的 untracked 专用用例）
             before = U.head_full(local)
             m.write_state({"state": "ok", "behind": 2, "repo": local, "checked_at": m._now()})
             expect(m.do_pull()[0], "先拉取成功")
-            open(os.path.join(local, "dirty.txt"), "w").write("x")
+            open(os.path.join(local, "a.txt"), "w").write("dirty-tracked")
             ok, msg = m.do_rollback()
             expect(not ok and "未提交" in msg, "脏工作区应拒绝（实际 %r,%r）" % (ok, msg))
             expect(U.head_full(local) != before, "被拒时 HEAD 不该动")

@@ -171,6 +171,37 @@ MUTANTS = [
      """    rc, out = run_git(repo, ["symbolic-ref", "--short", "refs/remotes/origin/HEAD"], QUERY_TIMEOUT)
     if False:
         return out"""),
+    # ⑩ 未跟踪文件也算脏 ⇒ 草稿/数据文件在仓库里常年躺着，更新闸门永远关着
+    #    （2026-10-09 实测：8 个 untracked 条目 => do_pull 恒拒绝）
+    ("[update] untracked 也算脏（草稿文件永久挡更新）", "dsh_update.py",
+     """    rc, out = run_git(repo, ["status", "--porcelain", "--untracked-files=no"], QUERY_TIMEOUT)
+    if rc != 0:
+        return False
+    return bool(out)""",
+     """    rc, out = run_git(repo, ["status", "--porcelain"], QUERY_TIMEOUT)
+    if rc != 0:
+        return False
+    return bool(out)"""),
+    # ⑪ 退回裸 pull ⇒ `git checkout -b X` 建的（无 upstream）分支报
+    #    "no tracking information"，用户按提示做完全套还是拉不动
+    ("[update] 无 upstream 时不显式拉取（checkout -b 后拉不动）", "dsh_update.py",
+     """    remote, branch = upstream_remote_branch(repo)
+    if remote and branch:
+        rc, out = run_git(repo, ["pull", "--ff-only", "--quiet", remote, branch], FETCH_TIMEOUT)
+    else:
+        rc, out = run_git(repo, ["pull", "--ff-only", "--quiet"], FETCH_TIMEOUT)""",
+     """    rc, out = run_git(repo, ["pull", "--ff-only", "--quiet"], FETCH_TIMEOUT)"""),
+    # ⑫ 回退入口又断线 ⇒ 菜单 [9] 更新完"不合适可回退"的承诺变空话
+    #    （2026-10-09 实测：_offer_rollback 写好了一直没接线，纯死代码）
+    ("[launcher] _offer_rollback 又断线（回退入口消失）", "dsh-launcher.py",
+     "    _offer_rollback()                         # 拉完/拉失败都给一次退路（默认 N，不扰）",
+     "    pass  # 拉完/拉失败都给一次退路（默认 N，不扰）"),
+    # ⑬ 确认方向反掉 ⇒ 用户明确输入 n 反而继续执行（2026-10-09 修的 bug 复活）
+    #    锚点带上 confirm 函数尾部三行 —— 局部 confirm（action_start 内）缩进不同，
+    #    但 `    return ask...` 是它的子串，所以必须带前面两行才唯一命中模块级。
+    ("[launcher] confirm 方向反掉（输入 n 变成继续）", "dsh-launcher.py",
+     '        log("  （--yes：自动确认）%s" % msg.strip())\n        return True\n    return ask(msg).strip().lower() == "y"',
+     '        log("  （--yes：自动确认）%s" % msg.strip())\n        return True\n    return not ask(msg)'),
 ]
 
 caught = missed = skipped = 0
